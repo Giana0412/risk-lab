@@ -23,7 +23,18 @@ MUTED = "#9a9993"
 BAD = "#b0302a"       # 하락 꼬리·손실
 NEG_BAR = "#b0302a"
 POS_BAR = "#1f4e8c"
-SOURCE = "자료: yfinance, 자체 계산"
+# ── 언어 ────────────────────────────────────────────────────────────────
+LANG = "ko"
+
+
+def set_lang(lang: str):
+    global LANG
+    LANG = "en" if lang == "en" else "ko"
+
+
+def t(ko: str, en: str) -> str:
+    """화면 문구 하나를 현재 언어로."""
+    return en if LANG == "en" else ko
 
 CSS = """
 <style>
@@ -148,13 +159,16 @@ def money(x: float) -> str:
 def pct(x: float, signed: bool = False, digits: int = 2) -> str:
     if _nan(x):
         return "–"
+    x = round(x, digits + 2) + 0.0  # −0.00% → 0.00%
     return (f"{x:+.{digits}%}" if signed else f"{x:.{digits}%}").replace("-", "−")
 
 
 def pp(x: float, digits: int = 1) -> str:
+    """상대수익 단위: 한국어 %p, 영어 pp."""
     if _nan(x):
         return "–"
-    return f"{x * 100:+.{digits}f}%p".replace("-", "−")
+    v = round(x * 100, digits) + 0.0  # −0.0 → 0.0
+    return f"{v:+.{digits}f}{'pp' if LANG == 'en' else '%p'}".replace("-", "−")
 
 
 def num(x: float, digits: int = 2) -> str:
@@ -202,6 +216,7 @@ def chapter(n: int):
 
 
 def _label(kind: str, k: int) -> str:
+    kind = {"그림": t("그림", "Figure"), "표": t("표", "Table")}[kind]
     return f"{kind} {N.chap}-{k}." if N.chap else f"{kind} {k}."
 
 
@@ -220,8 +235,8 @@ def table_title(title: str, sub: str = ""):
 
 
 def note(text: str, source: bool = True):
-    src = f"<br>{esc(SOURCE)}" if source else ""
-    st.markdown(f'<div class="rp-note">주: {esc(text)}{src}</div>', unsafe_allow_html=True)
+    src = f"<br>{esc(t('자료: yfinance, 자체 계산', 'Source: yfinance, author calculations'))}" if source else ""
+    st.markdown(f'<div class="rp-note">{t("주", "Note")}: {esc(text)}{src}</div>', unsafe_allow_html=True)
 
 
 def table(df: pd.DataFrame, fmt: dict[str, Callable] | None = None, neg_cols: tuple = (),
@@ -236,7 +251,8 @@ def table(df: pd.DataFrame, fmt: dict[str, Callable] | None = None, neg_cols: tu
         for c in df.columns:
             v = row[c]
             s = fmt[c](v) if c in fmt else ("–" if _nan(v) else esc(v))
-            cls = ' class="neg"' if c in neg_cols and isinstance(v, (int, float)) and not _nan(v) and v < 0 else ""
+            # 붉게 칠할지는 반올림된 표기로 정한다 — '+0.0' 이 붉게 나오지 않게
+            cls = ' class="neg"' if c in neg_cols and isinstance(v, (int, float)) and not _nan(v) and "−" in s else ""
             tds.append(f"<td{cls}>{s}</td>")
         em = ' class="em"' if idx in em_rows else ""
         body.append(f"<tr{em}>{''.join(tds)}</tr>")
