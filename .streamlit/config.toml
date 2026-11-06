@@ -1,0 +1,10 @@
+# 저장소 루트에서 `streamlit run app.py` 할 때 읽힌다 (Streamlit Cloud 도 같다).
+[theme]
+base = "light"
+primaryColor = "#1f4e8c"
+backgroundColor = "#fbfaf7"
+secondaryBackgroundColor = "#f2f0ea"
+textColor = "#1d1d1b"
+
+[client]
+toolbarMode = "minimal"
