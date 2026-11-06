@@ -371,7 +371,7 @@ fig = go.Figure(go.Bar(
     hovertemplate="%{customdata}<br>" + T("%{y:,}번", "%{y:,} runs") + "<extra></extra>"))
 fig.add_vline(x=nav, line_color=ui.INK, line_width=1)
 fig.add_annotation(x=nav, y=1, yref="paper", text=T(f"지금 {money(nav)}", f"Now {money(nav)}"),
-                   showarrow=False, xanchor="left", yanchor="bottom", xshift=6, font=dict(size=12, color=ui.INK))
+                   showarrow=False, xanchor="left", yanchor="top", xshift=8, bgcolor="#fbfaf7", font=dict(size=12, color=ui.INK))
 # 눈금은 원금 기준 깔끔한 % 간격에 — 946만 원 같은 어중간한 값을 피한다
 span_r = (hi - lo) / nav
 step = next(x for x in (0.01, 0.02, 0.05, 0.1, 0.2, 0.5) if span_r / x <= 6)
