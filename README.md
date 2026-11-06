@@ -4,24 +4,30 @@
 
 **Live demo:** [giana-risk-lab.streamlit.app](https://giana-risk-lab.streamlit.app/?lang=en)
 
-A Streamlit app that reviews a long-only equity book the way a risk desk would, laid out as a research report.
-I built it while competing in the Bloomberg Global Trading Challenge, to check our team's model book every day.
-The competition ranks teams on return relative to a benchmark, so every measure is reported both in **absolute**
-terms and **relative to the benchmark**.
+A Streamlit app that shows where a stock portfolio could be in a few weeks.
 
-![Outlook](docs/outlook_en.jpg)
+- **The front page is a calculator.** Enter stocks, an amount and a period, and it shows the value in a typical
+  outcome, a 1-in-20 bad outcome and a 1-in-100 bad outcome, plus the chance of beating a market index. Below that:
+  which stocks drive the swings, and what past crashes would have done to the same mix. Written for people with no
+  finance background.
+- **"Show the detailed analysis" opens the risk-desk view**: VaR and ES across methods, backtests, stress tests,
+  intraday monitoring and liquidity. I first built it during the Bloomberg Global Trading Challenge to check our
+  team's model book every day. The competition ranks teams on return relative to a benchmark, so this part reports
+  every measure both in **absolute** terms and **relative to the benchmark**.
 
-## What it answers
+![Front page](docs/front_en.jpg)
 
-| Chapter | Question | Method |
+## Detailed analysis: what it answers
+
+| Tab | Question | Method |
 |---|---|---|
-| 1. Outlook | Probability of beating the benchmark by the evaluation date, and how bad the downside is | GARCH(1,1) on excess returns with earnings days removed → filtered historical simulation (20,000 paths) + each holding's historical earnings-day reactions added as jumps. Compared side by side with the model-free realized distribution |
-| 2. Risk | Size of a one-day loss; which holdings drive risk | Historical VaR/ES, beta, tracking error, information ratio, Euler decomposition of normal VaR (component VaR) |
-| 3. VaR | How much VaR depends on the method | Historical · variance-covariance · Cornish-Fisher · EWMA (RiskMetrics) · FHS-GARCH · Monte Carlo (normal / multivariate t) |
-| 4. Backtest | Which method was actually right in the past | Rolling out-of-sample backtest; Kupiec POF, Christoffersen independence and conditional coverage; Basel traffic light |
-| 5. Stress | What if a CPI surprise or a past crisis repeats | Replay of 5 CPI release days and 10 crisis windows (holdings not yet listed are proxied by beta); five-factor regression shocks |
-| 6. Intraday | Where the book stands versus the benchmark right now | 5-minute relative return against VaR lines, refreshed every 60 seconds |
-| 7. Liquidity | Can the book be exited quickly | Days to liquidate at a participation rate of average daily traded value |
+| Outlook | Probability of beating the benchmark over the chosen period, and how bad the downside is | GARCH(1,1) on excess returns with earnings days removed → filtered historical simulation (20,000 paths) + each holding's historical earnings-day reactions added as jumps. Compared side by side with the model-free realized distribution |
+| Risk | Size of a one-day loss; which holdings drive risk | Historical VaR/ES, beta, tracking error, information ratio, Euler decomposition of normal VaR (component VaR) |
+| VaR | How much VaR depends on the method | Historical · variance-covariance · Cornish-Fisher · EWMA (RiskMetrics) · FHS-GARCH · Monte Carlo (normal / multivariate t) |
+| Backtest | Which method was actually right in the past | Rolling out-of-sample backtest; Kupiec POF, Christoffersen independence and conditional coverage; Basel traffic light |
+| Stress | What if a CPI surprise or a past crisis repeats | Replay of 5 CPI release days and 10 crisis windows (holdings not yet listed are proxied by beta); five-factor regression shocks |
+| Intraday | Where the book stands versus the benchmark right now | 5-minute relative return against VaR lines, refreshed every 60 seconds |
+| Liquidity | Can the book be exited quickly | Days to liquidate at a participation rate of average daily traded value |
 
 <p float="left">
   <img src="docs/backtest_en.jpg" width="49%" />
@@ -41,14 +47,14 @@ terms and **relative to the benchmark**.
   used. Trading days follow the NYSE holiday calendar.
 - **No look-ahead.** Each day's backtest forecast uses only data up to the previous close; GARCH parameters are
   re-estimated every 20 days.
-- **Don't trust the model blindly.** Chapter 1 shows the model distribution next to the realized distribution of
+- **Don't trust the model blindly.** The Outlook tab shows the model distribution next to the realized distribution of
   the same book and a variance ratio (Lo–MacKinlay corrected), and explains in words why they differ (usually
   the current volatility regime).
 - **No partial bars.** When the app runs during the session, yfinance's unfinished daily bar for today is
   dropped from the sample.
 - **numpy and pandas only.** No scipy: GARCH uses variance targeting to reduce the MLE to two parameters and
   evaluates a parameter grid in vectorized form.
-- **Bilingual.** Every visible string is written in Korean and English; switch in the sidebar or with
+- **Bilingual.** Every visible string is written in Korean and English; switch at the top right or with
   `?lang=en` / `?lang=ko`.
 
 ## Running locally
@@ -63,7 +69,7 @@ page colours and fonts in `.streamlit/config.toml` apply.
 
 ### Using your own book
 
-Edit tickers and weights (in percent) directly in the sidebar table. To keep a history of books and choose by
+Edit tickers and weights (in percent) directly in the table on the front page. To keep a history of books and choose by
 date, create a JSONL file and point the `BOOK_LOG` environment variable to it:
 
 ```jsonl
@@ -96,7 +102,7 @@ variance ratio, and the NYSE holiday calendar.
 |---|---|
 | `risk.py` | All calculations (VaR, ES, GARCH, FHS, backtests, stress, liquidity) |
 | `data.py` | Book log, prices and earnings calendar; NYSE holiday calendar |
-| `ui.py` | Report components (ruled tables, figure and table numbering, notes) and language switch |
+| `ui.py` | Page components (front-page figures, ruled tables, notes), money formatting (won or dollars), language switch |
 | `app.py` | Page layout and text |
 | `test_risk.py` | Calculation tests |
 
@@ -104,7 +110,7 @@ variance ratio, and the NYSE holiday calendar.
 
 - All figures are in-sample estimates from historical data. If a book was selected on recent performance, its
   information ratio and mean return over the same window look better than they should.
-- Chapter 1 assumes the book is held unchanged until the evaluation date; stop-losses and rebalancing are not
+- The outlook assumes the book is held unchanged until the evaluation date; stop-losses and rebalancing are not
   modelled.
 - The backtest replays the current book over the full history; it is not the book's actual track record.
 - Correlation between holdings' earnings reactions is ignored. Five-factor shocks are indicative only for

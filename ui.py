@@ -1,8 +1,7 @@
-"""화면 부품 — 리서치 리포트 형식. 계산은 없다.
+"""화면 부품. 계산은 없다.
 
-형식: 명조 제목, 산세리프 본문, 좁은 본문 폭. 강조는 굵기와 괘선으로만 하고
-상자·배경색·이모지는 쓰지 않는다. 차트와 표는 '그림 n.' / '표 n.' 번호를 달고
-아래에 주와 자료 출처를 붙인다.
+첫 화면은 계산기처럼: 입력 → 큰 숫자 몇 개 → 짧은 설명. 전문가용 탭은 괘선 표와
+짧은 주석. 강조는 굵기와 괘선으로만 하고 상자·배경색·이모지는 쓰지 않는다.
 """
 from __future__ import annotations
 
@@ -38,7 +37,6 @@ def t(ko: str, en: str) -> str:
 
 CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@500;700&display=swap');
 @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css');
 
 html, body, .stApp, .stMarkdown, p, li, label, input, textarea, button {
@@ -57,13 +55,46 @@ header[data-testid="stHeader"] { background: transparent; }
 .stTabs [aria-selected="true"] p { color: #1d1d1b; font-weight: 700; }
 .stTabs [data-baseweb="tab-highlight"] { background-color: #1d1d1b; height: 2px; }
 
+/* ── 첫 화면 ── */
+.q-top { display:flex; justify-content:space-between; align-items:baseline; font-size:.85rem; color:#5c5b57;
+  font-weight:600; letter-spacing:.02em; }
+.q-title { font-weight: 800; font-size: 2.1rem; line-height: 1.25; color: #1d1d1b; margin: 10px 0 6px;
+  letter-spacing: -0.025em; }
+.q-sub { font-size: 1.02rem; color: #5c5b57; line-height: 1.6; margin-bottom: 26px; }
+.q-step { font-size: 1.05rem; font-weight: 700; color: #1d1d1b; margin: 22px 0 6px; }
+.q-step span { display:inline-block; width:1.5em; color:#1f4e8c; }
+.q-hint { font-size: .86rem; color: #5c5b57; margin: 2px 0 8px; line-height: 1.55; }
+.q-hint.bad { color: #b0302a; }
+.q-result { border-top: 2px solid #1d1d1b; margin-top: 30px; padding-top: 14px; }
+.q-result .when { font-size: .85rem; color: #5c5b57; }
+.q-big { display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 0; margin: 14px 0 6px; }
+.q-big > div { padding: 4px 16px 10px 0; }
+.q-big > div + div { border-left: 1px solid #d9d7d0; padding-left: 16px; }
+.q-big .k { font-size: .9rem; color: #5c5b57; }
+.q-big .k small { display:block; font-size:.78rem; color:#9a9993; }
+.q-big .v { font-size: 2.05rem; font-weight: 800; color: #1d1d1b; font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em; margin-top: 4px; line-height: 1.15; }
+.q-big .v.neg { color: #b0302a; }
+.q-big .d { font-size: .9rem; color: #5c5b57; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.q-big .d.neg { color: #b0302a; }
+@media (max-width: 700px) {
+  .q-big { grid-template-columns: 1fr !important; }
+  .q-big > div + div { border-left: none; padding-left: 0; border-top: 1px solid #d9d7d0; padding-top: 10px; }
+  .q-title { font-size: 1.7rem; }
+}
+.q-line { font-size: 1.0rem; line-height: 1.7; color: #1d1d1b; margin: 6px 0 10px; }
+.q-h { font-size: 1.15rem; font-weight: 700; color: #1d1d1b; margin: 34px 0 4px; }
+.q-cap { font-size: .8rem; color: #9a9993; margin: -4px 0 10px; line-height: 1.5; }
+.q-expert { border-top: 1px solid #1d1d1b; margin-top: 44px; padding-top: 14px; }
+.q-foot { font-size: .76rem; color: #9a9993; margin-top: 40px; border-top: 1px solid #d9d7d0; padding-top: 8px; }
+
 .rp-kicker { font-size: .78rem; letter-spacing: .08em; color: #5c5b57; text-transform: uppercase;
   border-top: 3px solid #1d1d1b; padding-top: 8px; }
-.rp-title { font-family: 'Noto Serif KR', serif; font-weight: 700; font-size: 2.05rem; line-height: 1.25;
+.rp-title { font-weight: 800; font-size: 2.05rem; line-height: 1.25;
   color: #1d1d1b; margin: 6px 0 8px; letter-spacing: -0.01em; }
 .rp-byline { font-size: .86rem; color: #5c5b57; padding-bottom: 14px; }
 
-.rp-h2 { font-family: 'Noto Serif KR', serif; font-weight: 700; font-size: 1.32rem; color: #1d1d1b;
+.rp-h2 { font-weight: 700; font-size: 1.15rem; color: #1d1d1b;
   margin: 26px 0 8px; }
 .rp-p { font-size: 1.0rem; line-height: 1.75; color: #1d1d1b; margin: 0 0 12px; max-width: 46em; }
 .rp-p b { font-weight: 700; }
@@ -94,7 +125,7 @@ table.rp.txt td:first-child { white-space: nowrap; padding-right: 18px; }
 .rp-keys > div { padding: 10px 12px 10px 0; }
 .rp-keys > div + div { border-left: 1px solid #d9d7d0; padding-left: 12px; }
 .rp-keys .k { font-size: .78rem; color: #5c5b57; }
-.rp-keys .v { font-family: 'Noto Serif KR', serif; font-size: 1.55rem; font-weight: 700; color: #1d1d1b;
+.rp-keys .v { font-size: 1.5rem; font-weight: 700; color: #1d1d1b;
   font-variant-numeric: tabular-nums; margin-top: 2px; }
 .rp-keys .v.neg { color: #b0302a; }
 @media (max-width: 700px) { .rp-keys { grid-template-columns: repeat(2, minmax(0,1fr)) !important; } }
@@ -103,7 +134,7 @@ table.rp.txt td:first-child { white-space: nowrap; padding-right: 18px; }
 [data-testid="stSidebar"] .block-container, [data-testid="stSidebarUserContent"] { padding-top: 1.6rem; }
 .sb-head { border-top: 3px solid #1d1d1b; padding-top: 8px; margin-bottom: 18px; }
 .sb-head .k { font-size: .7rem; letter-spacing: .08em; color: #5c5b57; }
-.sb-head .t { font-family: 'Noto Serif KR', serif; font-weight: 700; font-size: 1.35rem; color: #1d1d1b; }
+.sb-head .t { font-weight: 800; font-size: 1.35rem; color: #1d1d1b; }
 .sb-sec { font-size: .72rem; font-weight: 700; letter-spacing: .08em; color: #1d1d1b;
   border-bottom: 1px solid #1d1d1b; padding-bottom: 4px; margin: 18px 0 8px; }
 [data-testid="stSidebar"] label p { font-size: .8rem; color: #5c5b57; font-weight: 500; }
@@ -150,10 +181,28 @@ def _nan(x) -> bool:
     return x is None or (isinstance(x, float) and math.isnan(x))
 
 
-def money(x: float) -> str:
+def usd(x: float) -> str:
     if _nan(x):
         return "–"
     return f"{'−' if x < 0 else ''}&#36;{abs(x):,.0f}"
+
+
+def won(x: float) -> str:
+    """1,234만 원 / 1억 2,340만 원 / 9,800원."""
+    if _nan(x):
+        return "–"
+    sign, a = ("−" if x < 0 else ""), abs(x)
+    if a >= 1e8:
+        eok, man = divmod(round(a / 1e4), 10_000)
+        return f"{sign}{eok:,}억" + (f" {man:,}만 원" if man else " 원")
+    if a >= 1e4:
+        return f"{sign}{round(a / 1e4):,}만 원"
+    return f"{sign}{a:,.0f}원"
+
+
+def money(x: float) -> str:
+    """금액 — 한국어 화면은 원, 영어 화면은 달러."""
+    return won(x) if LANG == "ko" else usd(x)
 
 
 def pct(x: float, signed: bool = False, digits: int = 2) -> str:
@@ -217,24 +266,24 @@ def chapter(n: int):
 
 def _label(kind: str, k: int) -> str:
     kind = {"그림": t("그림", "Figure"), "표": t("표", "Table")}[kind]
-    return f"{kind} {N.chap}-{k}." if N.chap else f"{kind} {k}."
+    return ""  # 번호는 달지 않는다 — 탭 안에서 그림이 두세 개뿐이다
 
 
 def figure(title: str, sub: str = ""):
     N.fig += 1
     s = f'<div class="s">{esc(sub)}</div>' if sub else ""
-    st.markdown(f'<div class="rp-fig"><div class="t">{_label("그림", N.fig)} {esc(title)}</div>{s}</div>',
+    st.markdown(f'<div class="rp-fig"><div class="t">{esc(title)}</div>{s}</div>',
                 unsafe_allow_html=True)
 
 
 def table_title(title: str, sub: str = ""):
     N.tab += 1
     s = f'<div class="s">{esc(sub)}</div>' if sub else ""
-    st.markdown(f'<div class="rp-fig"><div class="t">{_label("표", N.tab)} {esc(title)}</div>{s}</div>',
+    st.markdown(f'<div class="rp-fig"><div class="t">{esc(title)}</div>{s}</div>',
                 unsafe_allow_html=True)
 
 
-def note(text: str, source: bool = True):
+def note(text: str, source: bool = False):
     src = f"<br>{esc(t('자료: yfinance, 자체 계산', 'Source: yfinance, author calculations'))}" if source else ""
     st.markdown(f'<div class="rp-note">{t("주", "Note")}: {esc(text)}{src}</div>', unsafe_allow_html=True)
 
@@ -278,6 +327,19 @@ def layout(fig, height: int = 300, pct_axis: str | None = None, legend: bool = T
     elif pct_axis == "y":
         fig.update_yaxes(tickformat=".1%")
     return fig
+
+
+def html_(s: str):
+    st.markdown(s, unsafe_allow_html=True)
+
+
+def big(cells: list[tuple[str, str, str, str, bool]]):
+    """첫 화면 큰 숫자: (라벨, 작은 설명, 값, 아래 줄, 손실 여부)."""
+    out = "".join(
+        f'<div><div class="k">{esc(k)}<small>{esc(sm)}</small></div>'
+        f'<div class="v{" neg" if neg else ""}">{v}</div><div class="d{" neg" if neg else ""}">{d}</div></div>'
+        for k, sm, v, d, neg in cells)
+    html_(f'<div class="q-big" style="grid-template-columns:repeat({len(cells)},minmax(0,1fr))">{out}</div>')
 
 
 def side_head(kicker: str, title: str):

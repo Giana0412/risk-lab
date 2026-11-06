@@ -1,9 +1,10 @@
-"""Risk Lab — a research-report style risk dashboard for a long-only equity book.
+"""Risk Lab — what could a stock portfolio be worth in a few weeks, and why.
 
 Run:  streamlit run app.py          (?lang=en for English, ?lang=ko for Korean)
 
-Built during the Bloomberg Trading Challenge to check a model book every day.
-Calculations live in risk.py, data in data.py, report components in ui.py.
+The front page is a calculator: holdings in, a few plain numbers out. The detailed
+risk-desk analysis (VaR, backtests, stress tests, intraday, liquidity) sits behind
+a toggle. Calculations live in risk.py, data in data.py, page components in ui.py.
 Every visible string goes through T(korean, english).
 """
 from __future__ import annotations
@@ -19,17 +20,18 @@ import streamlit as st
 import data
 import risk
 import ui
-from ui import pct, pp, money, num, p, h2, keys, figure, table_title, note, table
+from ui import pct, pp, money, num, p, h2, keys, figure, table_title, note, table, html_, esc
 
 T = ui.t
 
-# ── 언어: ?lang=en 이면 영어로 연다. 사이드바에서 바꾸면 주소도 바뀐다 ─────────
+# ── 언어: ?lang=en 이면 영어로 연다 ─────────────────────────────────────
 _q = st.query_params.get("lang", "ko")
 if "lang" not in st.session_state:
     st.session_state.lang = "en" if _q == "en" else "ko"
 ui.set_lang(st.session_state.lang)
 
-st.set_page_config(page_title=T("리스크 랩", "Risk Lab"), page_icon="▤", layout="wide")
+st.set_page_config(page_title=T("리스크 랩", "Risk Lab"), page_icon="▤", layout="centered",
+                   initial_sidebar_state="collapsed")
 ui.inject_css()
 ui.chapter(0)
 
@@ -85,18 +87,28 @@ def short(k: str) -> str:
     return scen(k).split(" (")[0]
 
 
+def ro(word: str) -> str:
+    """'로/으로' — 받침 있으면(ㄹ 제외) 으로."""
+    c = word.strip()[-1:]
+    if "가" <= c <= "힣":
+        jong = (ord(c) - 0xAC00) % 28
+        return word + ("으로" if jong not in (0, 8) else "로")
+    return word + "로"
+
+
 def mday(d) -> str:
     return f"{d:%b %-d}" if ui.LANG == "en" else f"{d:%-m월 %-d일}"
 
 
 # ── 캐시된 데이터 ───────────────────────────────────────────────────────
 
-@st.cache_data(ttl=3600, show_spinner=T("가격 받는 중 (2007~)…", "Downloading prices (2007–)…"))
+@st.cache_data(ttl=3600, show_spinner=T("주가 기록을 받는 중이에요. 처음 한 번은 20초쯤 걸려요.",
+                                         "Downloading price history. The first load takes about 20 seconds."))
 def get_daily(tickers: tuple[str, ...]):
     return data.daily_prices(list(tickers))
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=T("실적 일정 받는 중…", "Downloading earnings calendar…"))
+@st.cache_data(ttl=6 * 3600, show_spinner=T("실적 발표 일정을 받는 중…", "Downloading earnings dates…"))
 def _earnings_one(t: str):
     return data.earnings_dates_one(t)  # 예외는 캐시되지 않는다 — 실패는 다음 실행에 다시 시도
 
@@ -121,106 +133,118 @@ def get_intraday(tickers: tuple[str, ...]):
     return data.intraday_prices(list(tickers))
 
 
-# ── 사이드바 ────────────────────────────────────────────────────────────
-
-ui.side_head(T("모델 북 리스크 점검", "Model book risk check"), T("리스크 랩", "Risk Lab"))
-
+# ════════════════════════════════════════════════════════════════════════
+# 첫 화면 — 입력
+# ════════════════════════════════════════════════════════════════════════
 
 def _switch_lang():
     st.session_state.lang = "en" if st.session_state._lang_pick == "English" else "ko"
     st.query_params["lang"] = st.session_state.lang
 
 
-st.sidebar.radio("Language", ["한국어", "English"], index=1 if ui.LANG == "en" else 0, horizontal=True,
-                 key="_lang_pick", on_change=_switch_lang, label_visibility="collapsed")
+c_brand, c_lang = st.columns([3, 1.3], vertical_alignment="center")
+c_brand.markdown('<div class="q-top">Risk Lab</div>', unsafe_allow_html=True)
+c_lang.radio("Language", ["한국어", "English"], index=1 if ui.LANG == "en" else 0, horizontal=True,
+             key="_lang_pick", on_change=_switch_lang, label_visibility="collapsed")
 
+html_(f'<div class="q-title">{T("내 주식, 몇 주 뒤엔 얼마가 될까?", "What could my stocks be worth in a few weeks?")}</div>'
+      f'<div class="q-sub">{T("종목과 비중을 넣으면, 과거 주가가 움직인 방식대로 앞날을 2만 번 돌려 보고 "
+                             "나올 만한 결과를 보여 줘요.",
+                             "Enter your stocks and how much of each you hold. The app replays the way these "
+                             "prices have moved 20,000 times and shows the range of likely outcomes.")}</div>')
+
+# ① 종목
+html_(f'<div class="q-step"><span>1</span>{T("무엇을 갖고 있나요?", "What do you hold?")}</div>')
 books = data.load_books()
-src = data.book_log_path()
-
-ui.side_section(T("북", "Book"))
 if books:
     def _book_label(b):
         kind = b.get("kind_en", b.get("kind", "")) if ui.LANG == "en" else b.get("kind", "")
-        return f"{b['date']} · {kind}"
+        return kind if data.using_sample() else f"{b['date']} · {kind}"
     labels = [_book_label(b) for b in books]
-    pick = st.sidebar.selectbox("book", range(len(books)), format_func=lambda i: labels[i],
-                                label_visibility="collapsed")
+    pick = st.selectbox(T("예시로 채우기", "Start from an example"), range(len(books)),
+                        format_func=lambda i: labels[i])
     base_book = books[pick]["book"]
-    if data.using_sample():
-        st.sidebar.caption(T("예시 북이다. 아래 표에서 종목과 비중을 바꿔 자신의 북을 넣을 수 있다.",
-                             "Sample book. Edit tickers and weights below to enter your own."))
 else:
-    pick = None
-    base_book = {"SPY": 0.5, "IWM": 0.5}
-    st.sidebar.warning(T("북 기록을 찾지 못해 기본 예시를 쓴다.", "No book log found; using a default example."))
+    pick, base_book = None, {"SPY": 0.5, "QQQ": 0.5}
 
-edited = st.sidebar.data_editor(
+edited = st.data_editor(
     pd.DataFrame({"티커": list(base_book), "비중": [float(v) * 100 for v in base_book.values()]}),
     num_rows="dynamic", hide_index=True, width="stretch",
-    key=f"book-{books[pick]['date'] if books else 'demo'}",
+    key=f"book-{pick}",
     column_config={
-        "티커": st.column_config.TextColumn(T("티커", "Ticker"), width="small"),
-        "비중": st.column_config.NumberColumn(T("비중 (%)", "Weight (%)"), format="%.2f",
-                                            min_value=0.0, max_value=100.0, step=0.01),
+        "티커": st.column_config.TextColumn(T("종목 코드", "Ticker"), width="medium",
+                                           help=T("야후 파이낸스 코드. 미국 주식은 AAPL, 한국 주식은 005930.KS처럼",
+                                                  "Yahoo Finance symbol, e.g. AAPL")),
+        "비중": st.column_config.NumberColumn(T("비중 (%)", "Share (%)"), format="%.1f",
+                                            min_value=0.0, max_value=100.0, step=0.1),
     },
 )
 weights = {str(t).strip().upper(): float(w) / 100 for t, w in zip(edited["티커"], edited["비중"])
            if isinstance(t, str) and t.strip() and pd.notna(w) and w > 0}
-
 wsum = sum(weights.values())
-over = [t for t, w in weights.items() if w > 0.20 + 1e-9]
 if wsum > 1 + 1e-9:
-    st.sidebar.error(T(f"비중 합 {wsum:.1%} — 레버리지 금지 제약 위반",
-                       f"Weights sum to {wsum:.1%} — breaches the no-leverage constraint"))
-if over:
-    st.sidebar.error(T(f"종목당 20% 상한 초과: {', '.join(over)}", f"Above the 20% single-name cap: {', '.join(over)}"))
-if wsum <= 1 + 1e-9 and not over and weights:
-    st.sidebar.caption(T(f"합계 {wsum:.1%} · 현금 {1 - wsum:.1%} · 제약 충족",
-                         f"Total {wsum:.1%} · cash {1 - wsum:.1%} · constraints met"))
+    html_(f'<div class="q-hint bad">{T(f"비중을 합하면 {wsum:.0%}예요. 100% 이하로 맞춰 주세요.",
+                                       f"The shares add up to {wsum:.0%}. Keep the total at 100% or less.")}</div>')
+    st.stop()
+html_(f'<div class="q-hint">{T("표를 눌러 고치거나 맨 아래 줄에 종목을 더할 수 있어요. ", "Click a cell to edit; add a stock in the bottom row. ")}'
+      + (T(f"합계 {wsum:.0%}, 나머지 {1 - wsum:.0%}는 현금으로 계산해요.",
+           f"Total {wsum:.0%}; the other {1 - wsum:.0%} is treated as cash.") if wsum < 1 - 1e-9 else
+         T("합계 100%.", "Total 100%."))
+      + '</div>')
 
-ui.side_section(T("설정", "Settings"))
-end_date = st.sidebar.date_input(T("평가 종료일", "Evaluation end date"),
-                                 (pd.Timestamp.today() + pd.Timedelta(days=28)).date(),
-                                 help=T("이 날까지 북을 그대로 보유한다고 가정한다 (1장 전망).",
-                                        "The book is assumed to be held unchanged until this date (Chapter 1)."))
-bench = st.sidebar.text_input(T("벤치마크", "Benchmark"), "ACWI",
-                              help=T("상대수익의 기준. Bloomberg Trading Challenge 평가 지수(WLS)에 가까운 ACWI가 기본.",
-                                     "Reference for relative return. Defaults to ACWI, the closest tradable proxy "
-                                     "for the Bloomberg Trading Challenge index (WLS).")).upper()
-with st.sidebar.expander(T("고급", "Advanced")):
-    lookback = st.select_slider(T("추정 창 (거래일)", "Estimation window (trading days)"), [125, 250, 500, 750],
-                                value=250, help=T("2·3장 계산에 쓰는 과거 구간 길이", "History used in Chapters 2–3"))
-    horizon = st.radio(T("2·3장 보유기간", "Horizon for Chapters 2–3"), [1, 5, 10], index=0, horizontal=True,
-                       format_func=lambda x: T(f"{x}일", f"{x}d"),
-                       help=T("h일 VaR = 1일 × √h (i.i.d. 가정)", "h-day VaR = 1-day × √h (i.i.d. assumption)"))
-    nav = st.number_input(T("운용자산 (USD)", "Assets under management (USD)"), value=1_000_000, step=100_000)
-    if src:
-        st.caption(T("북 출처: ", "Book source: ") + f"`{src.name}`")
+# ② 조건
+html_(f'<div class="q-step"><span>2</span>{T("조건", "Settings")}</div>')
+PERIODS = {5: T("1주", "1 week"), 10: T("2주", "2 weeks"), 21: T("1개월", "1 month"), 63: T("3개월", "3 months")}
+BENCHES = {"SPY": T("미국 S&P 500", "US S&P 500"), "ACWI": T("전 세계 주식", "Global stocks (ACWI)"),
+           "QQQ": T("나스닥 100", "Nasdaq 100"), "_": T("직접 입력", "Other…")}
+c1, c2, c3 = st.columns(3)
+if ui.LANG == "ko":
+    nav = c1.number_input("투자 금액 (원)", min_value=100_000, value=10_000_000, step=1_000_000, format="%d",
+                          key="amt_ko")
+else:
+    nav = c1.number_input("Amount invested ($)", min_value=100, value=10_000, step=1_000, format="%d", key="amt_en")
+c1.caption(money(nav))
+H = c2.selectbox(T("얼마 동안", "For how long"), list(PERIODS), index=2, format_func=lambda k: PERIODS[k])
+bpick = c3.selectbox(T("비교할 시장", "Compare with"), list(BENCHES), format_func=lambda k: BENCHES[k])
+if bpick == "_":
+    bench = st.text_input(T("비교할 지수나 ETF 코드", "Index or ETF ticker to compare with"), "ACWI").strip().upper()
+    bench_name = bench
+else:
+    bench, bench_name = bpick, BENCHES[bpick]
 
 if not weights:
-    st.info(T("사이드바에 종목과 비중을 넣는다.", "Enter tickers and weights in the sidebar."))
+    html_(f'<div class="q-hint">{T("종목을 하나 이상 넣어 주세요.", "Enter at least one stock.")}</div>')
     st.stop()
+
+# 전문가용 설정 — 위젯은 아래 전문가 영역에 있지만 값은 여기서 먼저 쓴다
+lookback = st.session_state.get("lookback", 250)
+horizon = st.session_state.get("horizon", 1)
 
 # ── 데이터 준비 ─────────────────────────────────────────────────────────
 
-all_tk = tuple(sorted(set(weights) | {bench} | set(data.FACTOR_TICKERS)))
+FX = "KRW=X"
+all_tk = tuple(sorted(set(weights) | {bench} | set(data.FACTOR_TICKERS) | ({FX} if ui.LANG == "ko" else set())))
 close, volume = get_daily(all_tk)
 missing = [t for t in weights if t not in close or close[t].dropna().empty]
 if missing:
-    st.warning(T(f"가격을 못 받은 종목은 빼고 계산한다: {', '.join(missing)}",
-                 f"No prices for these tickers; excluded: {', '.join(missing)}"))
+    miss_s = ", ".join(missing)
+    html_('<div class="q-hint bad">' + T(f"찾을 수 없는 종목 코드라 빼고 계산했어요: {miss_s}. "
+                                         "미국 주식은 AAPL, 한국 주식은 005930.KS처럼 넣어 주세요.",
+                                         f"Couldn’t find these tickers, so they were left out: {miss_s}.") + '</div>')
     weights = {t: w for t, w in weights.items() if t not in missing}
-if bench not in close or not weights:
-    st.error(T("벤치마크 또는 북 가격이 없다.", "No prices for the benchmark or the book."))
+if bench not in close or close[bench].dropna().empty or not weights:
+    st.error(T("주가를 받지 못했어요. 잠시 뒤 새로 고쳐 주세요.", "Couldn’t load prices. Please reload in a moment."))
     st.stop()
+fx = float(close[FX].dropna().iloc[-1]) if FX in close and close[FX].notna().any() else 1400.0
+nav_usd = nav / fx if ui.LANG == "ko" else nav  # 유동성 계산은 달러 거래대금과 비교한다
 
 rets_all = close.pct_change(fill_method=None)
 hold = list(weights)
-cols = list(dict.fromkeys(hold + [bench]))  # 벤치를 북에도 담으면 열이 중복된다
+cols = list(dict.fromkeys(hold + [bench]))  # 비교 지수를 종목으로도 담으면 열이 중복된다
 win = rets_all[cols].dropna().iloc[-lookback:]
 if len(win) < 60:
-    st.error(T(f"공통 표본이 {len(win)}일뿐이다. 최근 상장 종목이 있으면 추정 창을 줄인다.",
-               f"Only {len(win)} common days of data. Shorten the window if a holding listed recently."))
+    st.error(T(f"모든 종목이 함께 거래된 날이 {len(win)}일뿐이라 계산할 수 없어요. 최근 상장한 종목을 빼 보세요.",
+               f"Only {len(win)} days when all stocks traded together, which is too few. Try removing a recent listing."))
     st.stop()
 
 R = win[hold]
@@ -239,25 +263,238 @@ for t in hold:
     betas_bench[t] = float(x[t].cov(x[bench]) / x[bench].var()) if len(x) > 60 else 1.0
 betas_bench = pd.Series(betas_bench)
 
-remaining = data.trading_days(pd.Timestamp(asof) + pd.Timedelta(days=1), pd.Timestamp(end_date))
+remaining = data.trading_days(pd.Timestamp(asof) + pd.Timedelta(days=1),
+                              pd.Timestamp(asof) + pd.Timedelta(days=H * 2 + 20))[:H]
 
-# ── 머리 ────────────────────────────────────────────────────────────────
+# ── 앞날 시뮬레이션 (첫 화면과 전문가 1장이 같이 쓴다) ──────────────────
 
-cash = 1 - sum(weights.values())
-ui.masthead(T("리스크 랩 · 모델 북 리스크 점검", "Risk Lab · Model book risk check"),
-            T(f"{asof:%Y년 %-m월 %-d일} 종가 기준", f"As of close, {asof:%B %-d, %Y}"),
-            T(f"벤치마크 {bench} · {len(hold)}종목 · 현금 {cash:.1%} · 평가 종료까지 {len(remaining)}거래일 · "
-              f"추정 구간 {len(win)}거래일 · 사용 방법은 부록",
-              f"Benchmark {bench} · {len(hold)} holdings · cash {cash:.1%} · {len(remaining)} trading days to "
-              f"evaluation end · {len(win)}-day estimation window · see Appendix for usage"))
-if len(win) < lookback:
-    st.caption(T(f"공통 표본이 {len(win)}일로 요청한 {lookback}일보다 짧다 (최근 상장 종목).",
-                 f"Common sample is {len(win)} days, shorter than the requested {lookback} (recent listing)."))
+earn, earn_failed = get_earnings(tuple(t for t in hold if t != bench))
+future_days = close.index.append(remaining).unique().sort_values()
+past_rx, next_rx, next_ann = {}, {}, {}
+for t, ts_list in earn.items():
+    abn = rets_all[t] - betas_bench[t] * rets_all[bench]
+    rx = [risk.reaction_day(ts, future_days, abn) for ts in ts_list]
+    past_rx[t] = [d for d in rx if d is not None and d <= pd.Timestamp(asof)]
+    fut = [d for d in rx if d is not None and d > pd.Timestamp(asof)]
+    next_rx[t] = min(fut) if fut else None
+    ann = [ts for ts in ts_list if pd.Timestamp(ts.date()) > pd.Timestamp(asof)]
+    next_ann[t] = min(ann) if ann else None
+
+R_ex = risk.strip_jumps(R, bret, past_rx, betas_bench.to_dict())
+port_ex = risk.portfolio_returns(R_ex, weights)
+excess_ex = port_ex - bret
+c_w, c_next, c_in, c_avg, c_lo, c_hi, c_n = (
+    T("비중", "Weight"), T("다음 발표", "Next report"), T("평가 기간", "In window"),
+    T("평균 |반응|", "Mean |reaction|"), T("최저", "Worst"), T("최고", "Best"), T("표본", "Obs."))
+jump_rows, jumps_h, jumps_1, thin = [], {}, {}, []
+for t in hold:
+    if t == bench:
+        continue
+    js = risk.earnings_jumps(rets_all[t], rets_all[bench], past_rx.get(t, []), betas_bench[t])
+    nd = next_rx.get(t)
+    in_h = nd is not None and nd in remaining
+    if in_h and len(js) >= risk.MIN_JUMP_SAMPLES:
+        idio = (R_ex[t] - betas_bench[t] * bret).std()
+        jd = risk.deflate_jumps(js.to_numpy(), float(idio))
+        jumps_h[t] = (weights[t], jd)
+        if nd == remaining[0]:
+            jumps_1[t] = (weights[t], jd)
+    elif in_h:
+        thin.append((t, len(js)))
+    jump_rows.append({
+        "_t": t, c_w: weights[t],
+        c_next: f"{next_ann[t]:%Y-%m-%d %H:%M}" if next_ann.get(t) is not None else T("미정", "TBA"),
+        c_in: T("포함", "Yes") if in_h else "",
+        c_avg: js.abs().mean() if len(js) else np.nan,
+        c_lo: js.min() if len(js) else np.nan,
+        c_hi: js.max() if len(js) else np.nan,
+        c_n: len(js),
+    })
+
+out = risk.simulate_outcome(excess_ex, H, jumps_h)
+s_tot, s_base = out.stats("total"), out.stats("base")
+g = risk.garch_fit(excess_ex)
+long_cols = rets_all[cols].dropna().iloc[-1000:]
+ex_long = risk.portfolio_returns(long_cols[hold], weights) - long_cols[bench]
+s_real = risk.horizon_stats(risk.realized_horizon(ex_long, H)) if len(ex_long) > H + 60 else None
+vr = risk.variance_ratio(ex_long, H)
+p_win, q05, q01 = s_tot["P(상대 > +0%)"], s_tot["5%"], -s_tot["VaR 99%"]
+
+# 금액 결과는 평균 수익을 0으로 둔다 — 지난 1년 상승이 그대로 이어진다고 가정하지 않는다
+out_abs = risk.simulate_outcome(port_ex - port_ex.mean(), H, jumps_h)
+a_tot = out_abs.total  # 기간 누적수익 (일간 수익의 합)
+a05, a01, a50 = (float(np.quantile(out_abs.total, q)) for q in (0.05, 0.01, 0.5))
+
+# ════════════════════════════════════════════════════════════════════════
+# 첫 화면 — 결과
+# ════════════════════════════════════════════════════════════════════════
+
+per = PERIODS[H]
+html_(f'<div class="q-result"><div class="when">'
+      + T(f"{asof:%Y년 %-m월 %-d일} 종가까지의 주가로 계산 · 기간 {per} ({H}거래일)",
+          f"Based on prices up to the close on {asof:%B %-d, %Y} · {per} ({H} trading days)")
+      + '</div></div>')
+
+
+def after(r: float) -> str:
+    return money(nav * (1 + r))
+
+
+def delta(r: float) -> str:
+    v = nav * r
+    return ("+" if v >= 0 else "") + money(v)
+
+
+ui.big([
+    (T("보통이면", "Typical outcome"), T("가운데 결과", "the middle result"), after(a50), pct(a50, True, 1), False),
+    (T("운이 나쁘면", "A bad stretch"), T("20번에 1번 꼴", "about 1 in 20"), after(a05),
+     f"{delta(a05)} · {pct(a05, True, 1)}", True),
+    (T("아주 나쁘면", "A very bad stretch"), T("100번에 1번 꼴", "about 1 in 100"), after(a01),
+     f"{delta(a01)} · {pct(a01, True, 1)}", True),
+])
+
+lean = (T("시장보다 뒤처질 가능성이 더 커요.", "more likely to trail the market than beat it.") if p_win < 0.45 else
+        T("동전 던지기와 비슷해요.", "about a coin flip.") if p_win < 0.55 else
+        T("시장보다 앞설 가능성이 조금 더 커요.", "slightly more likely to beat the market."))
+html_(f'<div class="q-line">' + T(
+    f"{bench_name}보다 수익이 높을 확률은 <b>{p_win:.0%}</b>예요. {lean}",
+    f"Chance of doing better than the {bench_name}: <b>{p_win:.0%}</b>, {lean}") + '</div>')
+
+# 결과 분포 — 기간 끝 금액
+cnt, edges = np.histogram(nav * (1 + a_tot), bins=60)
+mids = (edges[:-1] + edges[1:]) / 2
+lo, hi = np.quantile(nav * (1 + a_tot), [0.003, 0.997])
+fig = go.Figure(go.Bar(
+    x=mids, y=cnt, marker_color=[ui.BAD if m < nav else ui.BOOK for m in mids], marker_line_width=0,
+    width=(edges[1] - edges[0]) * 0.85,
+    customdata=[f"{money(a)} ~ {money(b)}" for a, b in zip(edges[:-1], edges[1:])],
+    hovertemplate="%{customdata}<br>" + T("%{y:,}번", "%{y:,} runs") + "<extra></extra>"))
+fig.add_vline(x=nav, line_color=ui.INK, line_width=1)
+fig.add_annotation(x=nav, y=1, yref="paper", text=T(f"지금 {money(nav)}", f"Now {money(nav)}"),
+                   showarrow=False, xanchor="left", yanchor="bottom", xshift=6, font=dict(size=12, color=ui.INK))
+# 눈금은 원금 기준 깔끔한 % 간격에 — 946만 원 같은 어중간한 값을 피한다
+span_r = (hi - lo) / nav
+step = next(x for x in (0.01, 0.02, 0.05, 0.1, 0.2, 0.5) if span_r / x <= 6)
+ticks = [nav * (1 + k * step) for k in range(-50, 51) if lo <= nav * (1 + k * step) <= hi]
+fig.update_xaxes(range=[lo, hi], tickvals=ticks, ticktext=[money(v).replace("&#36;", "$") for v in ticks])
+fig.update_yaxes(showticklabels=False, showgrid=False)
+html_(f'<div class="q-h" style="margin-top:22px">{T(f"{per} 뒤 금액, 2만 번 돌려 본 결과", f"Value after {per}: 20,000 simulated runs")}</div>')
+html_(f'<div class="q-cap">{T("막대가 높을수록 자주 나온 금액이에요. 빨간 막대는 원금보다 줄어든 경우예요.", "Taller bars are more common outcomes. Red bars are runs that ended below what you put in.")}</div>')
+st.plotly_chart(ui.layout(fig, 240, legend=False), width="stretch", config={"displayModeBar": False})
+
+# ── 왜 그런가 ────────────────────────────────────────────────────────────
+
+# 종목별 흔들림
+if len(hold) > 1:
+    cv = risk.component_var(R, weights, 0.99)
+    top = cv.index[0]
+    html_(f'<div class="q-h">{T("어느 종목이 가장 많이 흔들까요?", "Which stocks move the total most?")}</div>')
+    html_('<div class="q-line">' + T(
+        f"<b>{top}</b>의 비중은 {cv.loc[top, '비중']:.0%}인데, 전체 흔들림의 <b>{cv.loc[top, '기여 비율']:.0%}</b>를 만들어요."
+        if cv.loc[top, "기여 비율"] > cv.loc[top, "비중"] * 1.2 else
+        f"흔들림이 비중과 비슷하게 나뉘어 있어요. 가장 큰 몫은 <b>{top}</b>({cv.loc[top, '기여 비율']:.0%})예요.",
+        f"<b>{top}</b> is {cv.loc[top, '비중']:.0%} of the money but drives <b>{cv.loc[top, '기여 비율']:.0%}</b> of the ups and downs."
+        if cv.loc[top, "기여 비율"] > cv.loc[top, "비중"] * 1.2 else
+        f"The ups and downs are spread roughly in line with the amounts held. The largest share is <b>{top}</b> "
+        f"({cv.loc[top, '기여 비율']:.0%}).") + '</div>')
+    order = list(cv.index)[::-1]
+    fig = go.Figure()
+    fig.add_bar(y=order, x=cv.loc[order, "비중"], orientation="h", name=T("넣은 돈의 비중", "Share of money"),
+                marker_color="#c9c7c0", text=[f"{v:.0%}" for v in cv.loc[order, "비중"]], textposition="outside",
+                cliponaxis=False, hovertemplate="%{y} %{x:.0%}<extra></extra>")
+    fig.add_bar(y=order, x=cv.loc[order, "기여 비율"], orientation="h", name=T("흔들림의 몫", "Share of the swings"),
+                marker_color=ui.BOOK, text=[f"{v:.0%}" for v in cv.loc[order, "기여 비율"]], textposition="outside",
+                cliponaxis=False, hovertemplate="%{y} %{x:.0%}<extra></extra>")
+    fig.update_layout(barmode="group", bargap=0.35, bargroupgap=0.08, legend_traceorder="reversed")
+    fig.update_xaxes(visible=False, range=[0, float(max(cv["기여 비율"].max(), cv["비중"].max())) * 1.25])
+    fig.update_yaxes(showgrid=False, type="category")
+    st.plotly_chart(ui.layout(fig, 70 + 46 * len(order)), width="stretch", config={"displayModeBar": False})
+    html_(f'<div class="q-cap">{T("파란 막대가 회색보다 길면, 넣은 돈에 비해 값이 크게 출렁이거나 다른 종목과 같이 움직이는 종목이에요.", "A blue bar longer than the grey one means the stock swings more than its size suggests, or moves together with the others.")}</div>')
+
+# 실적 발표
+if jumps_h or thin:
+    names = ", ".join(list(jumps_h) + [t for t, _ in thin])
+    html_(f'<div class="q-h">{T("이 기간에 실적 발표가 있어요", "Earnings reports fall in this period")}</div>')
+    html_('<div class="q-line">' + T(
+        f"발표 예정: <b>{names}</b>. 실적 발표 날에는 주가가 평소보다 훨씬 크게 움직이곤 해서, 그 종목들의 과거 발표 날 움직임을 결과에 넣었어요.",
+        f"Reporting: <b>{names}</b>. Prices often jump on earnings day, so each one's past earnings-day moves are built into the results.")
+        + (T(" 다만 과거 기록이 적어 넣지 못한 종목이 있어요(" + ", ".join(t for t, _ in thin) + "). 실제 위험은 위보다 클 수 있어요.",
+             " " + ", ".join(t for t, _ in thin) + " has too little history to include, so real risk may be larger.")
+           if thin else "") + '</div>')
+if earn_failed:
+    html_(f'<div class="q-hint">{T("실적 발표 일정을 받지 못한 종목이 있어 그 영향은 빠졌어요: ", "Earnings dates unavailable, so their effect is left out: ")}'
+          f'{", ".join(earn_failed)}</div>')
+
+# 과거 위기
+hist = risk.stress_replay(close, weights, bench, risk.HISTORICAL_SCENARIOS, betas_bench)
+if not hist.empty:
+    worst = hist["북"].idxmin()
+    beat = int((hist["북"] > hist["벤치"]).sum())
+    html_(f'<div class="q-h">{T("과거 위기 때 갖고 있었다면", "If you had held it through past crashes")}</div>')
+    html_('<div class="q-line">' + T(
+        f"가장 크게 잃은 때는 <b>{short(worst)}</b>{ro(short(worst))[len(short(worst)):]} {pct(hist.loc[worst, '북'], True, 0)}, "
+        f"{money(nav)}이 {money(nav * (1 + hist.loc[worst, '북']))}이 됐을 거예요. "
+        f"위기 {len(hist)}번 중 {beat}번은 {bench_name}보다 덜 잃었어요.",
+        f"The worst was the <b>{short(worst)}</b>: {pct(hist.loc[worst, '북'], True, 0)}, which would have turned {money(nav)} into "
+        f"{money(nav * (1 + hist.loc[worst, '북']))}. It lost less than the {bench_name} in {beat} of {len(hist)} crises.")
+        + '</div>')
+    hh = hist.sort_values("북")
+    lab = [short(i) for i in hh.index]
+    fig = go.Figure()
+    fig.add_bar(y=lab, x=hh["북"], orientation="h", name=T("내 주식", "Your stocks"), marker_color=ui.BAD,
+                hovertemplate="%{y}<br>%{x:+.1%}<extra></extra>")
+    fig.add_scatter(y=lab, x=hh["벤치"], mode="markers", name=bench_name,
+                    marker=dict(symbol="line-ns", size=16, line=dict(width=2.5, color=ui.INK)),
+                    hovertemplate="%{y}<br>" + bench_name + " %{x:+.1%}<extra></extra>")
+    span = float(np.abs(hh[["북", "벤치"]].to_numpy()).max()) * 1.08
+    # 숫자는 막대 끝이 아니라 오른쪽 한 열에 — 시장 눈금과 겹치지 않게
+    fig.add_scatter(y=lab, x=[span * 0.06] * len(lab), mode="text", showlegend=False, hoverinfo="skip",
+                    text=[f"<b>{pct(b, True, 0)}</b>  <span style='color:{ui.INK2}'>{T('시장', 'market')} {pct(m, True, 0)}</span>"
+                          for b, m in zip(hh["북"], hh["벤치"])],
+                    textposition="middle right", textfont=dict(size=12, color=ui.INK))
+    fig.update_xaxes(range=[-span, span * 0.75], tickvals=[v for v in (-0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 0) if v > -span],
+                     tickformat=".0%", zeroline=True, zerolinecolor=ui.INK, zerolinewidth=1)
+    fig.update_yaxes(autorange="reversed", showgrid=False, type="category")
+    st.plotly_chart(ui.layout(fig, 70 + 30 * len(lab)), width="stretch", config={"displayModeBar": False})
+    proxied = float(hist["대리 비중"].max())
+    html_(f'<div class="q-cap">{T("지금의 비중을 그 기간에 그대로 적용한 결과예요. 세로 선은 비교 시장.", "Today’s mix applied to each period. The vertical tick is the market you compare with.")}'
+          + (T(" 당시 상장 전이던 종목은 시장 움직임으로 대신 계산했어요.", " Stocks not yet listed at the time are stood in for by the market.") if proxied > 0 else "")
+          + '</div>')
+
+html_(f'<div class="q-cap" style="margin-top:28px">{T(
+    "주의: 과거 주가의 움직임으로 만든 추정이에요. 앞으로도 그렇게 움직인다는 보장은 없고, 투자 조언이 아니에요. "
+    "금액 결과는 평균 수익을 0으로 두고(지난 상승이 이어진다고 가정하지 않음) 기간 동안 사고팔지 않는다고 가정했어요.",
+    "These are estimates built from how prices moved in the past. There is no guarantee they will move the same way, "
+    "and this is not investment advice. The value results assume zero average return (no assumption that recent gains "
+    "continue) and no buying or selling during the period.")}</div>')
+
+# ════════════════════════════════════════════════════════════════════════
+# 전문가용
+# ════════════════════════════════════════════════════════════════════════
+
+html_('<div class="q-expert"></div>')
+expert = st.toggle(T("자세히 보기 (전문가용)", "Show the detailed analysis (for practitioners)"), key="expert")
+html_(f'<div class="q-cap" style="margin-top:2px">{T(
+    "리스크 관리 실무 지표: VaR·ES 방법 비교, 모형 사후검증, 스트레스 테스트, 장중 모니터링, 유동성.",
+    "Risk-desk measures: VaR and ES across methods, backtests, stress tests, intraday monitoring, liquidity.")}</div>')
+if not expert:
+    html_('<div class="q-foot">Risk Lab · ' + T("가격 자료: Yahoo Finance", "Prices: Yahoo Finance") +
+          ' · <a href="https://github.com/Giana0412/risk-lab" style="color:inherit">GitHub</a></div>')
+    st.stop()
+
+with st.expander(T("계산 설정", "Calculation settings")):
+    e1, e2 = st.columns(2)
+    e1.select_slider(T("추정 창 (거래일)", "Estimation window (trading days)"), [125, 250, 500, 750],
+                     value=lookback, key="lookback", help=T("리스크·VaR 탭 계산에 쓰는 과거 구간 길이", "History used in the Risk and VaR tabs"))
+    e2.radio(T("리스크·VaR 탭 보유기간", "Horizon for the Risk and VaR tabs"), [1, 5, 10], index=[1, 5, 10].index(horizon),
+             horizontal=True, key="horizon", format_func=lambda x: T(f"{x}일", f"{x}d"),
+             help=T("h일 VaR = 1일 × √h (i.i.d. 가정)", "h-day VaR = 1-day × √h (i.i.d. assumption)"))
+    st.caption(T(f"비교 지수 {bench} · {len(hold)}종목 · 현금 {1 - sum(weights.values()):.1%} · 추정 구간 {len(win)}거래일",
+                 f"Benchmark {bench} · {len(hold)} holdings · cash {1 - sum(weights.values()):.1%} · {len(win)}-day window"))
 
 tab_out, tab_sum, tab_var, tab_bt, tab_st, tab_live, tab_liq, tab_help = st.tabs([
-    T("1. 전망", "1. Outlook"), T("2. 리스크 개요", "2. Risk"), T("3. VaR 방법론", "3. VaR"),
-    T("4. 모형 검증", "4. Backtest"), T("5. 스트레스 테스트", "5. Stress"), T("6. 장중", "6. Intraday"),
-    T("7. 유동성", "7. Liquidity"), T("부록. 사용 방법", "Appendix")])
+    T("전망", "Outlook"), T("리스크", "Risk"), T("VaR", "VaR"), T("검증", "Backtest"),
+    T("스트레스", "Stress"), T("장중", "Intraday"), T("유동성", "Liquidity"), T("읽는 법", "Guide")])
 
 # ════════════════════════════════════════════════════════════════════════
 # 1. 전망 / Outlook
@@ -265,187 +502,131 @@ tab_out, tab_sum, tab_var, tab_bt, tab_st, tab_live, tab_liq, tab_help = st.tabs
 
 with tab_out:
     ui.chapter(1)
-    if len(remaining) == 0:
-        p(T("남은 거래일이 없다. 사이드바의 평가 종료일을 확인한다.",
-            "No trading days remain. Check the evaluation end date in the sidebar."))
+    h2(T(f"앞으로 {H}거래일, 벤치를 이길 확률 {p_win:.0%}",
+         f"{H} trading days to go: {p_win:.0%} probability of beating the benchmark"))
+    lean_ko = ("벤치에 뒤처지는 쪽으로 기운다" if p_win < 0.45 else
+               "어느 쪽으로도 기울지 않는다" if p_win < 0.55 else "벤치를 앞서는 쪽으로 기운다")
+    lean_en = ("leans toward underperformance" if p_win < 0.45 else
+               "is roughly balanced" if p_win < 0.55 else "leans toward outperformance")
+    p(T(f"현재 북을 {mday(remaining[0])}부터 {mday(remaining[-1])}까지 그대로 보유한다고 가정하면, "
+        f"{bench} 대비 상대수익이 플러스일 확률은 <b>{p_win:.0%}</b>로 추정되며 분포는 {lean_ko}. "
+        f"하위 5% 시나리오는 <b>{pp(q05)}</b>, 하위 1% 시나리오는 <b>{pp(q01)}</b>이다. "
+        f"투자 금액 기준으로 하위 5%는 약 {money(q05 * nav)}에 해당한다.",
+        f"If the current book is held unchanged from {mday(remaining[0])} to {mday(remaining[-1])}, the "
+        f"probability of a positive return relative to {bench} is estimated at <b>{p_win:.0%}</b>, and the "
+        f"distribution {lean_en}. The 5th-percentile scenario is <b>{pp(q05)}</b> and the 1st-percentile "
+        f"scenario is <b>{pp(q01)}</b>. On the amount invested, the 5th percentile is about "
+        f"{money(q05 * nav)}."))
+    if jumps_h:
+        p(T(f"평가 기간 중 실적 발표가 예정된 종목은 {', '.join(jumps_h)}이며, 해당 종목의 과거 실적일 반응을 "
+            "분포에 반영했다.",
+            f"{', '.join(jumps_h)} report earnings within the window; their historical earnings-day reactions "
+            "are included in the distribution."))
     else:
-        earn, earn_failed = get_earnings(tuple(t for t in hold if t != bench))
-        future_days = close.index.append(remaining).unique().sort_values()
-        past_rx, next_rx, next_ann = {}, {}, {}
-        for t, ts_list in earn.items():
-            abn = rets_all[t] - betas_bench[t] * rets_all[bench]
-            rx = [risk.reaction_day(ts, future_days, abn) for ts in ts_list]
-            past_rx[t] = [d for d in rx if d is not None and d <= pd.Timestamp(asof)]
-            fut = [d for d in rx if d is not None and d > pd.Timestamp(asof)]
-            next_rx[t] = min(fut) if fut else None
-            ann = [ts for ts in ts_list if pd.Timestamp(ts.date()) > pd.Timestamp(asof)]
-            next_ann[t] = min(ann) if ann else None
+        p(T("평가 기간 중 실적 발표가 예정된 보유 종목은 없다.",
+            "No holding is scheduled to report earnings within the window."))
+    if jumps_1:
+        o1 = risk.simulate_outcome(excess_ex, 1, jumps_1)
+        p(T(f"<b>다음 거래일({mday(remaining[0])})에 {', '.join(jumps_1)}의 실적 반응이 예정되어 있다.</b> "
+            f"이 경우 하루 하위 1% 상대손실은 {pp(-risk.var_fhs(excess_ex, 0.99))}에서 "
+            f"<b>{pp(-o1.stats()['VaR 99%'])}</b>로 커진다.",
+            f"<b>{', '.join(jumps_1)} react to earnings on the next trading day ({mday(remaining[0])}).</b> "
+            f"That widens the one-day 1st-percentile relative loss from {pp(-risk.var_fhs(excess_ex, 0.99))} "
+            f"to <b>{pp(-o1.stats()['VaR 99%'])}</b>."))
+    for t, n in thin:
+        p(T(f"{t}는 평가 기간 중 실적 발표가 있으나 과거 표본이 {n}건에 그쳐 분포에 반영하지 못했다. "
+            "실제 위험은 위 수치보다 크다.",
+            f"{t} reports within the window, but with only {n} past observations its earnings risk is not "
+            "included. True risk is larger than shown."))
+    if earn_failed:
+        p(T("다음 종목은 실적 일정을 받지 못해 실적 위험이 빠져 있다: ",
+            "Earnings calendar unavailable, so earnings risk is excluded for: ") +
+          ", ".join(f"{t} ({ui.esc(e)})" for t, e in earn_failed.items()) + ".")
 
-        R_ex = risk.strip_jumps(R, bret, past_rx, betas_bench.to_dict())
-        excess_ex = risk.portfolio_returns(R_ex, weights) - bret
-        c_w, c_next, c_in, c_avg, c_lo, c_hi, c_n = (
-            T("비중", "Weight"), T("다음 발표", "Next report"), T("평가 기간", "In window"),
-            T("평균 |반응|", "Mean |reaction|"), T("최저", "Worst"), T("최고", "Best"), T("표본", "Obs."))
-        jump_rows, jumps_h, jumps_1, thin = [], {}, {}, []
-        for t in hold:
-            if t == bench:
-                continue
-            js = risk.earnings_jumps(rets_all[t], rets_all[bench], past_rx.get(t, []), betas_bench[t])
-            nd = next_rx.get(t)
-            in_h = nd is not None and nd in remaining
-            if in_h and len(js) >= risk.MIN_JUMP_SAMPLES:
-                idio = (R_ex[t] - betas_bench[t] * bret).std()
-                jd = risk.deflate_jumps(js.to_numpy(), float(idio))
-                jumps_h[t] = (weights[t], jd)
-                if nd == remaining[0]:
-                    jumps_1[t] = (weights[t], jd)
-            elif in_h:
-                thin.append((t, len(js)))
-            jump_rows.append({
-                "_t": t, c_w: weights[t],
-                c_next: f"{next_ann[t]:%Y-%m-%d %H:%M}" if next_ann.get(t) is not None else T("미정", "TBA"),
-                c_in: T("포함", "Yes") if in_h else "",
-                c_avg: js.abs().mean() if len(js) else np.nan,
-                c_lo: js.min() if len(js) else np.nan,
-                c_hi: js.max() if len(js) else np.nan,
-                c_n: len(js),
-            })
+    keys([(T("벤치를 이길 확률", "P(beat benchmark)"), f"{p_win:.0%}", False),
+          (T("중앙값", "Median"), pp(s_tot["중앙"]), s_tot["중앙"] < 0),
+          (T("하위 5%", "5th percentile"), pp(q05), True),
+          (T("하위 1%", "1st percentile"), pp(q01), True)])
 
-        H = len(remaining)
-        out = risk.simulate_outcome(excess_ex, H, jumps_h)
-        s_tot, s_base = out.stats("total"), out.stats("base")
-        g = risk.garch_fit(excess_ex)
-        long_cols = rets_all[cols].dropna().iloc[-1000:]
-        ex_long = risk.portfolio_returns(long_cols[hold], weights) - long_cols[bench]
-        s_real = risk.horizon_stats(risk.realized_horizon(ex_long, H)) if len(ex_long) > H + 60 else None
-        vr = risk.variance_ratio(ex_long, H)
-        p_win, q05, q01 = s_tot["P(상대 > +0%)"], s_tot["5%"], -s_tot["VaR 99%"]
+    figure(T(f"남은 {H}거래일 상대수익 분포", f"Distribution of relative return over the next {H} trading days"),
+           T(f"북 − {bench}, 시뮬레이션 경로 수", f"Book − {bench}, number of simulated paths"))
+    cnt, edges = np.histogram(out.total, bins=70)
+    mids = (edges[:-1] + edges[1:]) / 2
+    fig = go.Figure(go.Bar(
+        x=mids, y=cnt, marker_color=[ui.BAD if m < q05 else ui.BOOK for m in mids], marker_line_width=0,
+        width=(edges[1] - edges[0]) * 0.9, customdata=np.stack([edges[:-1], edges[1:]], axis=1),
+        hovertemplate="%{customdata[0]:+.1%} ~ %{customdata[1]:+.1%}: %{y:,}<extra></extra>"))
+    fig.add_vline(x=0, line_color=ui.INK, line_width=1)
+    fig.add_annotation(x=q05, y=1, yref="paper", text=f"{T('하위 5%', '5th pct')} {pp(q05)}", showarrow=False,
+                       xanchor="right", yanchor="top", font=dict(size=11, color=ui.BAD))
+    lo, hi = np.quantile(out.total, [0.002, 0.998])
+    fig.update_xaxes(range=[lo, hi])
+    fig.update_yaxes(showticklabels=False, showgrid=False)
+    st.plotly_chart(ui.layout(fig, 260, "x", legend=False), width="stretch")
+    note(T("평소 거래일은 실적일을 제외한 초과수익에 GARCH(1,1)를 적합하고 표준화 잔차를 복원추출(FHS)해 "
+           "2만 개 경로를 생성했다. 실적 반응은 종목별 과거 실적일 초과수익에서 추출했다. "
+           "손절과 리밸런싱은 반영하지 않았다. 붉은 막대는 하위 5% 구간.",
+           "Ordinary days: GARCH(1,1) fitted to excess returns with earnings days removed, then 20,000 paths "
+           "generated by resampling standardized residuals (filtered historical simulation). Earnings "
+           "reactions are drawn from each holding's past earnings-day excess returns. Stop-losses and "
+           "rebalancing are not modelled. Red bars mark the bottom 5%."))
 
-        h2(T(f"평가 종료까지 {H}거래일, 벤치를 이길 확률 {p_win:.0%}",
-             f"{H} trading days to go: {p_win:.0%} probability of beating the benchmark"))
-        lean_ko = ("벤치에 뒤처지는 쪽으로 기운다" if p_win < 0.45 else
-                   "어느 쪽으로도 기울지 않는다" if p_win < 0.55 else "벤치를 앞서는 쪽으로 기운다")
-        lean_en = ("leans toward underperformance" if p_win < 0.45 else
-                   "is roughly balanced" if p_win < 0.55 else "leans toward outperformance")
-        p(T(f"현재 북을 {mday(remaining[0])}부터 {mday(remaining[-1])}까지 그대로 보유한다고 가정하면, "
-            f"{bench} 대비 상대수익이 플러스일 확률은 <b>{p_win:.0%}</b>로 추정되며 분포는 {lean_ko}. "
-            f"하위 5% 시나리오는 <b>{pp(q05)}</b>, 하위 1% 시나리오는 <b>{pp(q01)}</b>이다. "
-            f"운용자산 기준으로 하위 5%는 약 {money(q05 * nav)}에 해당한다.",
-            f"If the current book is held unchanged from {mday(remaining[0])} to {mday(remaining[-1])}, the "
-            f"probability of a positive return relative to {bench} is estimated at <b>{p_win:.0%}</b>, and the "
-            f"distribution {lean_en}. The 5th-percentile scenario is <b>{pp(q05)}</b> and the 1st-percentile "
-            f"scenario is <b>{pp(q01)}</b>. On the current asset base, the 5th percentile is about "
-            f"{money(q05 * nav)}."))
-        if jumps_h:
-            p(T(f"평가 기간 중 실적 발표가 예정된 종목은 {', '.join(jumps_h)}이며, 해당 종목의 과거 실적일 반응을 "
-                "분포에 반영했다.",
-                f"{', '.join(jumps_h)} report earnings within the window; their historical earnings-day reactions "
-                "are included in the distribution."))
-        else:
-            p(T("평가 기간 중 실적 발표가 예정된 보유 종목은 없다.",
-                "No holding is scheduled to report earnings within the window."))
-        if jumps_1:
-            o1 = risk.simulate_outcome(excess_ex, 1, jumps_1)
-            p(T(f"<b>다음 거래일({mday(remaining[0])})에 {', '.join(jumps_1)}의 실적 반응이 예정되어 있다.</b> "
-                f"이 경우 하루 하위 1% 상대손실은 {pp(-risk.var_fhs(excess_ex, 0.99))}에서 "
-                f"<b>{pp(-o1.stats()['VaR 99%'])}</b>로 커진다.",
-                f"<b>{', '.join(jumps_1)} react to earnings on the next trading day ({mday(remaining[0])}).</b> "
-                f"That widens the one-day 1st-percentile relative loss from {pp(-risk.var_fhs(excess_ex, 0.99))} "
-                f"to <b>{pp(-o1.stats()['VaR 99%'])}</b>."))
-        for t, n in thin:
-            p(T(f"{t}는 평가 기간 중 실적 발표가 있으나 과거 표본이 {n}건에 그쳐 분포에 반영하지 못했다. "
-                "실제 위험은 위 수치보다 크다.",
-                f"{t} reports within the window, but with only {n} past observations its earnings risk is not "
-                "included. True risk is larger than shown."))
-        if earn_failed:
-            p(T("다음 종목은 실적 일정을 받지 못해 실적 위험이 빠져 있다: ",
-                "Earnings calendar unavailable, so earnings risk is excluded for: ") +
-              ", ".join(f"{t} ({ui.esc(e)})" for t, e in earn_failed.items()) + ".")
+    h2(T("모형 추정치와 과거 실현치의 차이", "Model estimate versus realized history"))
+    vols = {T("4년", "4y"): float(ex_long.std()), T("1년", "1y"): float(ex_long.iloc[-250:].std()),
+            T("3개월", "3m"): float(ex_long.iloc[-60:].std()), T("1개월", "1m"): float(ex_long.iloc[-20:].std())}
+    v4, v1m = list(vols.values())[0], list(vols.values())[3]
+    hot = g.sigma_next > 1.2 * v4
+    if s_real:
+        wider = s_real["5%"] > q05
+        p(T(f"같은 북을 지난 {len(ex_long)}거래일 동안 보유했을 때 실제 {H}일 상대수익의 하위 5%는 "
+            f"<b>{pp(s_real['5%'])}</b>로, 모형 추정치({pp(q05)})보다 {'좁다' if wider else '넓다'}. "
+            + (f"일간 상대 변동성이 4년 평균 {v4:.2%}에서 최근 1개월 {v1m:.2%}로 높아진 상태이며, 모형은 이 "
+               f"수준이 점차 낮아진다고 가정한다(다음 거래일 추정 {g.sigma_next:.2%}). 변동성이 유지되면 모형 "
+               "쪽이, 평균으로 돌아가면 과거 실현치 쪽이 현실에 가깝다."
+               if hot else "현재 변동성은 평소 수준이어서 두 추정치의 차이는 크지 않다."),
+            f"Had the same book been held over the past {len(ex_long)} trading days, the realized 5th percentile "
+            f"of {H}-day relative return would have been <b>{pp(s_real['5%'])}</b>, "
+            f"{'narrower' if wider else 'wider'} than the model's {pp(q05)}. "
+            + (f"Daily relative volatility has risen from a four-year average of {v4:.2%} to {v1m:.2%} over the "
+               f"past month; the model assumes it decays gradually (next-day estimate {g.sigma_next:.2%}). If "
+               "volatility persists the model is closer to reality; if it mean-reverts, history is."
+               if hot else "Volatility is near its usual level, so the two estimates are close.")))
+    rows = [(T("벤치를 이길 확률", "P(beat benchmark)"), "P(상대 > +0%)", "p"),
+            (T("+2%p 이상 앞설 확률", "P(lead by more than 2pp)"), "P(상대 > +2%)", "p"),
+            (T("2%p 넘게 뒤처질 확률", "P(trail by more than 2pp)"), "P(상대 < −2%)", "p"),
+            (T("중앙값", "Median"), "중앙", "v"), (T("하위 5%", "5th percentile"), "5%", "v"),
+            (T("하위 1%", "1st percentile"), "VaR 99%", "neg")]
 
-        keys([(T("벤치를 이길 확률", "P(beat benchmark)"), f"{p_win:.0%}", False),
-              (T("중앙값", "Median"), pp(s_tot["중앙"]), s_tot["중앙"] < 0),
-              (T("하위 5%", "5th percentile"), pp(q05), True),
-              (T("하위 1%", "1st percentile"), pp(q01), True)])
+    def cell(sd, k, kind):
+        return f"{sd[k]:.0%}" if kind == "p" else pp(-sd[k] if kind == "neg" else sd[k])
+    comp = {T("모형", "Model"): [cell(s_tot, k, kd) for _, k, kd in rows]}
+    if s_real:
+        comp[T(f"과거 실현 ({len(ex_long)}일)", f"Realized ({len(ex_long)}d)")] = [cell(s_real, k, kd) for _, k, kd in rows]
+    if jumps_h:
+        comp[T("모형 (실적 제외)", "Model (ex-earnings)")] = [cell(s_base, k, kd) for _, k, kd in rows]
+    table_title(T(f"{H}거래일 상대수익 분포 비교", f"{H}-day relative return: model versus history"))
+    table(pd.DataFrame(comp, index=[r[0] for r in rows]))
+    extra = ""
+    if not math.isnan(vr) and (vr < 0.85 or vr > 1.15):
+        extra = T(f" 분산비 {vr:.2f}: 초과수익이 " + ("되돌림을 보여 모형이 꼬리를 과대평가할 수 있다." if vr < 0.85
+                                                else "추세를 보여 모형이 꼬리를 과소평가할 수 있다."),
+                  f" Variance ratio {vr:.2f}: excess returns " +
+                  ("mean-revert, so the model may overstate the tails." if vr < 0.85
+                   else "trend, so the model may understate the tails."))
+    note(T("과거 실현은 겹치는 구간으로 계산했으며 실적일을 포함한다.",
+           "Realized figures use overlapping windows and include earnings days.") + extra)
 
-        figure(T(f"남은 {H}거래일 상대수익 분포", f"Distribution of relative return over the next {H} trading days"),
-               T(f"북 − {bench}, 시뮬레이션 경로 수", f"Book − {bench}, number of simulated paths"))
-        cnt, edges = np.histogram(out.total, bins=70)
-        mids = (edges[:-1] + edges[1:]) / 2
-        fig = go.Figure(go.Bar(
-            x=mids, y=cnt, marker_color=[ui.BAD if m < q05 else ui.BOOK for m in mids], marker_line_width=0,
-            width=(edges[1] - edges[0]) * 0.9, customdata=np.stack([edges[:-1], edges[1:]], axis=1),
-            hovertemplate="%{customdata[0]:+.1%} ~ %{customdata[1]:+.1%}: %{y:,}<extra></extra>"))
-        fig.add_vline(x=0, line_color=ui.INK, line_width=1)
-        fig.add_annotation(x=q05, y=1, yref="paper", text=f"{T('하위 5%', '5th pct')} {pp(q05)}", showarrow=False,
-                           xanchor="right", yanchor="top", font=dict(size=11, color=ui.BAD))
-        lo, hi = np.quantile(out.total, [0.002, 0.998])
-        fig.update_xaxes(range=[lo, hi])
-        fig.update_yaxes(showticklabels=False, showgrid=False)
-        st.plotly_chart(ui.layout(fig, 260, "x", legend=False), width="stretch")
-        note(T("평소 거래일은 실적일을 제외한 초과수익에 GARCH(1,1)를 적합하고 표준화 잔차를 복원추출(FHS)해 "
-               "2만 개 경로를 생성했다. 실적 반응은 종목별 과거 실적일 초과수익에서 추출했다. "
-               "손절과 리밸런싱은 반영하지 않았다. 붉은 막대는 하위 5% 구간.",
-               "Ordinary days: GARCH(1,1) fitted to excess returns with earnings days removed, then 20,000 paths "
-               "generated by resampling standardized residuals (filtered historical simulation). Earnings "
-               "reactions are drawn from each holding's past earnings-day excess returns. Stop-losses and "
-               "rebalancing are not modelled. Red bars mark the bottom 5%."))
-
-        h2(T("모형 추정치와 과거 실현치의 차이", "Model estimate versus realized history"))
-        vols = {T("4년", "4y"): float(ex_long.std()), T("1년", "1y"): float(ex_long.iloc[-250:].std()),
-                T("3개월", "3m"): float(ex_long.iloc[-60:].std()), T("1개월", "1m"): float(ex_long.iloc[-20:].std())}
-        v4, v1m = list(vols.values())[0], list(vols.values())[3]
-        hot = g.sigma_next > 1.2 * v4
-        if s_real:
-            wider = s_real["5%"] > q05
-            p(T(f"같은 북을 지난 {len(ex_long)}거래일 동안 보유했을 때 실제 {H}일 상대수익의 하위 5%는 "
-                f"<b>{pp(s_real['5%'])}</b>로, 모형 추정치({pp(q05)})보다 {'좁다' if wider else '넓다'}. "
-                + (f"일간 상대 변동성이 4년 평균 {v4:.2%}에서 최근 1개월 {v1m:.2%}로 높아진 상태이며, 모형은 이 "
-                   f"수준이 점차 낮아진다고 가정한다(다음 거래일 추정 {g.sigma_next:.2%}). 변동성이 유지되면 모형 "
-                   "쪽이, 평균으로 돌아가면 과거 실현치 쪽이 현실에 가깝다."
-                   if hot else "현재 변동성은 평소 수준이어서 두 추정치의 차이는 크지 않다."),
-                f"Had the same book been held over the past {len(ex_long)} trading days, the realized 5th percentile "
-                f"of {H}-day relative return would have been <b>{pp(s_real['5%'])}</b>, "
-                f"{'narrower' if wider else 'wider'} than the model's {pp(q05)}. "
-                + (f"Daily relative volatility has risen from a four-year average of {v4:.2%} to {v1m:.2%} over the "
-                   f"past month; the model assumes it decays gradually (next-day estimate {g.sigma_next:.2%}). If "
-                   "volatility persists the model is closer to reality; if it mean-reverts, history is."
-                   if hot else "Volatility is near its usual level, so the two estimates are close.")))
-        rows = [(T("벤치를 이길 확률", "P(beat benchmark)"), "P(상대 > +0%)", "p"),
-                (T("+2%p 이상 앞설 확률", "P(lead by more than 2pp)"), "P(상대 > +2%)", "p"),
-                (T("2%p 넘게 뒤처질 확률", "P(trail by more than 2pp)"), "P(상대 < −2%)", "p"),
-                (T("중앙값", "Median"), "중앙", "v"), (T("하위 5%", "5th percentile"), "5%", "v"),
-                (T("하위 1%", "1st percentile"), "VaR 99%", "neg")]
-
-        def cell(sd, k, kind):
-            return f"{sd[k]:.0%}" if kind == "p" else pp(-sd[k] if kind == "neg" else sd[k])
-        comp = {T("모형", "Model"): [cell(s_tot, k, kd) for _, k, kd in rows]}
-        if s_real:
-            comp[T(f"과거 실현 ({len(ex_long)}일)", f"Realized ({len(ex_long)}d)")] = [cell(s_real, k, kd) for _, k, kd in rows]
-        if jumps_h:
-            comp[T("모형 (실적 제외)", "Model (ex-earnings)")] = [cell(s_base, k, kd) for _, k, kd in rows]
-        table_title(T(f"{H}거래일 상대수익 분포 비교", f"{H}-day relative return: model versus history"))
-        table(pd.DataFrame(comp, index=[r[0] for r in rows]))
-        extra = ""
-        if not math.isnan(vr) and (vr < 0.85 or vr > 1.15):
-            extra = T(f" 분산비 {vr:.2f}: 초과수익이 " + ("되돌림을 보여 모형이 꼬리를 과대평가할 수 있다." if vr < 0.85
-                                                    else "추세를 보여 모형이 꼬리를 과소평가할 수 있다."),
-                      f" Variance ratio {vr:.2f}: excess returns " +
-                      ("mean-revert, so the model may overstate the tails." if vr < 0.85
-                       else "trend, so the model may understate the tails."))
-        note(T("과거 실현은 겹치는 구간으로 계산했으며 실적일을 포함한다.",
-               "Realized figures use overlapping windows and include earnings days.") + extra)
-
-        h2(T("보유 종목 실적 일정", "Earnings calendar for holdings"))
-        jr = pd.DataFrame(jump_rows).set_index("_t").sort_values(c_in, ascending=False)
-        table_title(T("실적 발표 일정과 과거 실적일 반응", "Earnings dates and historical earnings-day reactions"),
-                    T("반응 = 반응일 종목 수익률 − β × 벤치 수익률", "Reaction = stock return − β × benchmark return"))
-        table(jr, fmt={c_w: lambda v: f"{v:.1%}", c_avg: lambda v: pct(v, digits=1),
-                       c_lo: lambda v: pct(v, True, 1), c_hi: lambda v: pct(v, True, 1), c_n: lambda v: f"{int(v)}"},
-              neg_cols=(c_lo,), index_name=T("종목", "Ticker"))
-        note(T("발표 시각이 개장(09:30 ET) 전이면 당일, 이후면 다음 거래일을 반응일로 본다. "
-               "시각이 00:00으로 기록된 경우 두 날 중 반응이 큰 날을 택했다. 다음 발표 시각은 미 동부 기준.",
-               "Reports before the 09:30 ET open react the same day; later reports react the next trading day. "
-               "When the time is recorded as 00:00, the day with the larger reaction is used. Times are US Eastern."))
+    h2(T("보유 종목 실적 일정", "Earnings calendar for holdings"))
+    jr = pd.DataFrame(jump_rows).set_index("_t").sort_values(c_in, ascending=False)
+    table_title(T("실적 발표 일정과 과거 실적일 반응", "Earnings dates and historical earnings-day reactions"),
+                T("반응 = 반응일 종목 수익률 − β × 벤치 수익률", "Reaction = stock return − β × benchmark return"))
+    table(jr, fmt={c_w: lambda v: f"{v:.1%}", c_avg: lambda v: pct(v, digits=1),
+                   c_lo: lambda v: pct(v, True, 1), c_hi: lambda v: pct(v, True, 1), c_n: lambda v: f"{int(v)}"},
+          neg_cols=(c_lo,), index_name=T("종목", "Ticker"))
+    note(T("발표 시각이 개장(09:30 ET) 전이면 당일, 이후면 다음 거래일을 반응일로 본다. "
+           "시각이 00:00으로 기록된 경우 두 날 중 반응이 큰 날을 택했다. 다음 발표 시각은 미 동부 기준.",
+           "Reports before the 09:30 ET open react the same day; later reports react the next trading day. "
+           "When the time is recorded as 00:00, the day with the larger reaction is used. Times are US Eastern."))
 
 # ════════════════════════════════════════════════════════════════════════
 # 2. 리스크 개요 / Risk summary
@@ -544,11 +725,11 @@ with tab_var:
     p(T(f"동일한 북과 데이터에 대해 벤치 대비 {horizon}일 99% VaR는 {METHOD_NAMES[lo_m]}에서 "
         f"<b>{pp(-rel99.min())}</b>, {METHOD_NAMES[hi_m]}에서 <b>{pp(-rel99.max())}</b>로 추정된다. 최근 데이터에 "
         "가중을 두는 방법(EWMA, FHS-GARCH)일수록 값이 크다면 최근 변동성이 표본 평균보다 높다는 뜻이다. "
-        "방법 간 적합성은 4장에서 검증한다.",
+        "방법 간 적합성은 검증 탭에서 확인한다.",
         f"For the same book and data, the {horizon}-day 99% relative VaR ranges from <b>{pp(-rel99.min())}</b> "
         f"({METHOD_NAMES[lo_m]}) to <b>{pp(-rel99.max())}</b> ({METHOD_NAMES[hi_m]}). When methods that weight "
         "recent data (EWMA, FHS-GARCH) give larger values, recent volatility is above the sample average. "
-        "Chapter 4 tests which method fits."))
+        "The Backtest tab tests which method fits."))
 
     figure(T(f"방법별 {horizon}일 99% VaR", f"{horizon}-day 99% VaR by method"),
            T("오른쪽일수록 손실을 크게 추정", "Further right = larger estimated loss"))
@@ -849,7 +1030,7 @@ with tab_liq:
     part = st.slider(T("체결 가능 비율 (일평균 거래대금 대비)", "Participation rate (share of average daily value)"),
                      5, 30, 20, 5, format="%d%%") / 100
     adv = volume[hold].iloc[-20:].mean()
-    lq = risk.liquidity(weights, close[hold].iloc[-1], adv, nav, part)
+    lq = risk.liquidity(weights, close[hold].iloc[-1], adv, nav_usd, part)
     worst = lq["청산일"].idxmax()
     dmax = lq.loc[worst, "청산일"]
     h2(T(f"전 종목 청산에 최대 {dmax:.3f}일", f"Full liquidation takes at most {dmax:.3f} days"))
@@ -865,14 +1046,14 @@ with tab_liq:
                                   T("거래대금 대비", "Share of ADV"), T("청산 소요 (일)", "Days to exit"))
     table_title(T("종목별 청산 소요", "Time to liquidate by holding"))
     table(pd.DataFrame({c_pos: lq["보유($)"], c_adv: lq["ADV($)"], c_sh: lq["ADV 대비"], c_days: lq["청산일"]}),
-          fmt={c_pos: money, c_adv: lambda v: f"{money(v / 1e6)}M" if not math.isnan(v) else "–",
+          fmt={c_pos: ui.usd, c_adv: lambda v: f"{ui.usd(v / 1e6)}M" if not math.isnan(v) else "–",
                c_sh: lambda v: f"{v:.3%}", c_days: lambda v: f"{v:.3f}"},
           index_name=T("종목", "Ticker"))
     note(T("일평균 거래대금은 최근 20거래일 평균. 체결 비용과 슬리피지는 반영하지 않았다.",
            "Average daily value over the last 20 trading days. Transaction costs and slippage are not modelled."))
 
 # ════════════════════════════════════════════════════════════════════════
-# 부록. 사용 방법 / Appendix. How to use
+# 읽는 법 / Guide
 # ════════════════════════════════════════════════════════════════════════
 
 with tab_help:
@@ -880,151 +1061,52 @@ with tab_help:
 
     def help_table(index_ko, index_en, cols_):
         """cols_: [(열 이름 ko, en, 값 ko 목록, 값 en 목록)]"""
-        df = pd.DataFrame({T(ck, ce): (vk if ui.LANG == "ko" else ve) for ck, ce, vk, ve in cols_},
-                          index=index_ko if ui.LANG == "ko" else index_en)
-        return df
+        return pd.DataFrame({T(ck, ce): (vk if ui.LANG == "ko" else ve) for ck, ce, vk, ve in cols_},
+                            index=index_ko if ui.LANG == "ko" else index_en)
 
-    h2(T("실행", "Running"))
-    p(T("저장소 폴더에서 <code>pip install -r requirements.txt</code> 후 <code>streamlit run app.py</code>를 "
-        "실행하고 브라우저에서 localhost:8501을 연다. 저장소 폴더 안에서 실행해야 지면 색과 글꼴 설정"
-        "(.streamlit/config.toml)이 적용된다. 처음 열 때 2007년부터의 가격을 받느라 20초 안팎이 걸리고, "
-        "이후에는 캐시를 쓴다. 주소에 <code>?lang=en</code>을 붙이면 영어로 연다.",
-        "From the repository folder, run <code>pip install -r requirements.txt</code> and then "
-        "<code>streamlit run app.py</code>, and open localhost:8501. Run it from the repository folder so the "
-        "page colours and fonts in .streamlit/config.toml apply. The first load takes about 20 seconds to "
-        "download prices back to 2007; later loads use the cache. Add <code>?lang=ko</code> to the URL for Korean."))
-
-    h2(T("북 고르기와 고치기", "Choosing and editing a book"))
-    p(T("왼쪽 사이드바의 <b>북</b> 목록은 북 기록 파일에서 읽는다. 환경변수 <code>BOOK_LOG</code>가 가리키는 JSONL "
-        "파일이 있으면 그것을, 없으면 저장소의 예시 북(sample_books.jsonl)을 쓴다. 날짜를 고르면 그날 북의 종목과 "
-        "비중이 아래 표에 채워진다. 표는 직접 고칠 수 있다.",
-        "The <b>Book</b> list in the sidebar is read from a book log. If the environment variable "
-        "<code>BOOK_LOG</code> points to a JSONL file, that file is used; otherwise the sample books in the "
-        "repository (sample_books.jsonl). Choosing a date fills the table below with that book's tickers and "
-        "weights, which you can edit directly."))
-    table(help_table(["비중 바꾸기", "종목 추가", "종목 삭제", "원래 북으로 되돌리기"],
-                     ["Change a weight", "Add a holding", "Remove a holding", "Restore the original book"],
-                     [("방법", "How", ["비중 칸을 두 번 눌러 숫자를 입력한다. 단위는 %다.",
-                                       "표 맨 아래 빈 줄에 티커와 비중을 넣는다. 야후 파이낸스 티커를 쓴다.",
-                                       "줄 왼쪽 칸을 눌러 선택한 뒤 Delete 키를 누른다.",
-                                       "다른 날짜를 골랐다가 다시 고르거나 페이지를 새로 고친다."],
-                       ["Double-click the weight cell and type a number, in percent.",
-                        "Type a ticker and weight in the empty bottom row. Use Yahoo Finance tickers.",
-                        "Click the cell at the left of the row to select it, then press Delete.",
-                        "Select another date and back, or reload the page."])]),
-          text=True, index_name=T("할 일", "Task"))
-    note(T("표 아래 줄에 비중 합계와 현금이 표시된다. 합계가 100%를 넘거나 한 종목이 20%를 넘으면 운용 제약"
-           "(레버리지 금지, 종목당 20%) 위반 경고가 뜬다. 고친 비중은 화면에서만 쓰이고 기록 파일은 바뀌지 않는다.",
-           "The line below the table shows total weight and cash. A warning appears if the total exceeds 100% or "
-           "a holding exceeds 20% (no leverage, 20% single-name cap). Edits apply to the page only; the log file "
-           "is not changed."), source=False)
-
-    h2(T("설정", "Settings"))
-    table(help_table(["평가 종료일", "벤치마크", "추정 창 (고급)", "보유기간 (고급)", "운용자산 (고급)"],
-                     ["Evaluation end date", "Benchmark", "Estimation window (Advanced)", "Horizon (Advanced)",
-                      "Assets under management (Advanced)"],
-                     [("뜻", "Meaning",
-                       ["1장 전망의 시뮬레이션 기간을 정한다. 기본값은 오늘부터 4주 뒤.",
-                        "상대수익을 잴 기준. Bloomberg Trading Challenge 평가 지수(WLS)에 가까운 ACWI가 기본이다.",
-                        "2·3장 계산에 쓰는 과거 구간 길이. 짧을수록 최근 상황을, 길수록 평균적인 상황을 반영한다.",
-                        "2·3장 VaR의 기간. 1일 외에는 √기간을 곱한다(3장 FHS-GARCH는 경로 시뮬레이션).",
-                        "금액 환산에 쓰는 규모. 기본값은 100만 달러."],
-                       ["Sets the simulation period for Chapter 1. Defaults to four weeks from today.",
-                        "Reference for relative return. Defaults to ACWI, close to the Bloomberg Trading Challenge "
-                        "index (WLS).",
-                        "History used in Chapters 2–3. Shorter reflects recent conditions; longer, average conditions.",
-                        "VaR horizon in Chapters 2–3. Beyond one day, scaled by √horizon (FHS-GARCH in Chapter 3 "
-                        "simulates paths instead).",
-                        "Used to convert percentages to dollars. Defaults to USD 1 million."])]),
-          text=True, index_name=T("항목", "Setting"))
-
-    h2(T("장별로 무엇을 보나", "What each chapter answers"))
-    table(help_table(["1. 전망", "2. 리스크 개요", "3. VaR 방법론", "4. 모형 검증", "5. 스트레스 테스트", "6. 장중",
-                      "7. 유동성"],
-                     ["1. Outlook", "2. Risk", "3. VaR", "4. Backtest", "5. Stress", "6. Intraday", "7. Liquidity"],
+    h2(T("탭별로 무엇을 보나", "What each tab answers"))
+    table(help_table(["전망", "리스크", "VaR", "검증", "스트레스", "장중", "유동성"],
+                     ["Outlook", "Risk", "VaR", "Backtest", "Stress", "Intraday", "Liquidity"],
                      [("답하는 질문", "Question",
-                       ["남은 기간에 벤치를 이길 확률과 나쁠 때의 폭", "하루 손실 규모와 위험을 많이 내는 종목",
+                       ["남은 기간에 비교 지수를 이길 확률과 나쁠 때의 폭, 모형과 과거 실현치의 차이",
+                        "하루 손실 규모와 위험을 많이 내는 종목",
                         "VaR가 계산 방법에 따라 얼마나 달라지나", "어떤 VaR 방법이 과거에 실제로 맞았나",
-                        "CPI 발표일이나 과거 위기가 다시 오면", "지금 장중에 벤치 대비 어디쯤인가", "한 번에 다 팔 수 있나"],
-                       ["Odds of beating the benchmark by the end date, and how bad it gets",
+                        "CPI 발표일이나 과거 위기가 다시 오면, 요인 충격을 주면",
+                        "지금 장중에 비교 지수 대비 어디쯤인가", "한 번에 다 팔 수 있나"],
+                       ["Odds of beating the benchmark, how bad it gets, and model versus realized history",
                         "Size of a one-day loss and which holdings drive risk",
                         "How much VaR depends on the method", "Which VaR method was actually right in the past",
-                        "What if a CPI surprise or a past crisis repeats", "Where the book stands versus the benchmark now",
-                        "Can the book be exited quickly"]),
+                        "What if a CPI surprise or a past crisis repeats; factor shocks",
+                        "Where the book stands versus the benchmark right now", "Can the book be exited quickly"]),
                       ("먼저 볼 것", "Look first at",
-                       ["제목의 확률, 하위 5%·1%", "종목별 위험 기여 표의 배수", "그림 3-1의 점 간격", "표 4-1의 판정 열",
-                        "그림 5-1, 5-2의 붉은 막대", "제목의 벤치 대비 수치와 VaR 선", "청산 소요 열"],
-                       ["The probability in the heading; 5th and 1st percentiles", "Multiples in the risk contribution table",
-                        "Spread of points in Figure 3-1", "Verdict column in Table 4-1",
-                        "Red bars in Figures 5-1 and 5-2", "Relative figure in the heading and the VaR lines",
-                        "Days-to-exit column"])]),
-          text=True, index_name=T("장", "Chapter"))
-
-    h2(T("쓰는 순서", "Suggested routine"))
-    p(T("<b>매일 아침.</b> 사이드바에서 가장 최근 날짜의 북을 고르고 1장을 본다. 벤치를 이길 확률과 하위 5%가 "
-        "전날보다 크게 나빠졌는지, 실적 일정 표에 '평가 기간: 포함'인 종목이 생겼는지 확인한다.",
-        "<b>Each morning.</b> Select the latest book and read Chapter 1. Check whether the probability of beating "
-        "the benchmark or the 5th percentile has deteriorated, and whether any holding now reports earnings "
-        "within the window."))
-    p(T("<b>큰 발표 전날.</b> CPI·FOMC 같은 일정 전에는 5장의 CPI 발표일 재현과 가상 충격을 본다. 특정 시나리오에서 "
-        "벤치 대비 손실이 큰 종목이 있으면 2장의 위험 기여 표에서 그 종목의 배수를 함께 본다.",
-        "<b>Before a major release.</b> Ahead of CPI or FOMC, read the CPI replay and hypothetical shocks in "
-        "Chapter 5. If one holding drives a large relative loss, check its multiple in Chapter 2."))
-    p(T("<b>장중.</b> 6장에서 '60초마다 갱신'을 켜 둔다. 벤치 대비 선이 붉은 점선(VaR 99%) 아래로 내려가면 "
-        "추정 구간 기준으로 100거래일에 한 번 나올 손실이다.",
-        "<b>During the session.</b> Turn on 'Refresh every 60 seconds' in Chapter 6. A relative line below the "
-        "red dotted VaR 99% marks a loss expected about once in 100 trading days."))
-    p(T("<b>비중을 바꿔 보고 싶을 때.</b> 사이드바 표에서 비중을 고치면 모든 장이 다시 계산된다. 실제 주문 전에 "
-        "1장의 확률과 하위 5%가 어떻게 움직이는지 비교하는 용도로 쓴다.",
-        "<b>Trying new weights.</b> Editing weights in the sidebar recomputes every chapter. Use it before "
-        "trading to compare how the Chapter 1 probability and 5th percentile move."))
-
-    h2(T("새 데이터 받기", "Refreshing data"))
-    table(help_table(["일봉 가격", "실적 일정", "장중 분봉", "모형 검증 결과"],
-                     ["Daily prices", "Earnings calendar", "Intraday bars", "Backtest results"],
-                     [("보관 시간", "Cached for", ["1시간", "6시간", "60초", "1시간"], ["1 hour", "6 hours", "60 seconds", "1 hour"]),
-                      ("강제로 새로 받으려면", "To force a refresh",
-                       ["오른쪽 위 메뉴 → Clear cache, 또는 키보드 C"] * 3 + ["같음"],
-                       ["Top-right menu → Clear cache, or press C"] * 3 + ["Same"])]),
-          text=True, index_name=T("데이터", "Data"))
-    note(T("장중에 열면 아직 끝나지 않은 당일 봉은 자동으로 제외한다. 화면을 다시 계산만 하려면 키보드 R.",
-           "During the session, today's unfinished daily bar is excluded automatically. Press R to rerun only."),
-         source=False)
+                       ["하위 5%·1%와 분포 비교 표", "종목별 위험 기여 표의 배수", "방법별 VaR 그림의 점 간격",
+                        "사후검증 표의 판정 열", "위기 재현 그림의 붉은 막대", "VaR 선과의 거리", "청산 소요 열"],
+                       ["5th/1st percentiles and the comparison table", "Multiples in the risk contribution table",
+                        "Spread of points in the VaR-by-method chart", "Verdict column of the backtest table",
+                        "Red bars in the crisis replay", "Distance to the VaR lines", "Days-to-exit column"])]),
+          text=True, index_name=T("탭", "Tab"))
+    note(T("첫 화면의 금액은 절대수익(평균 0 가정), 이 탭들의 '벤치 대비'는 비교 지수를 뺀 상대수익이다. "
+           "%p는 상대수익의 차이를 뜻한다.",
+           "Front-page values are absolute returns with zero drift; 'relative' here means return minus the "
+           "benchmark, in percentage points (pp)."))
 
     h2(T("숫자를 읽을 때 주의할 점", "Caveats"))
-    p(T("모든 수치는 과거 데이터로 만든 추정이다. 특히 다음을 염두에 둔다.",
-        "All figures are estimates from historical data. In particular:"))
-    table(help_table(["표본내 편향", "손절 미반영", "재현 가정", "요인 모형 한계", "데이터 지연"],
-                     ["In-sample bias", "No stop-losses", "Replay assumption", "Factor model limits", "Data delay"],
+    table(help_table(["표본내 편향", "매매 미반영", "재현 가정", "요인 모형 한계", "데이터"],
+                     ["In-sample bias", "No trading", "Replay assumption", "Factor model limits", "Data"],
                      [("내용", "Detail",
-                       ["북을 최근 성적으로 골랐기 때문에 같은 구간으로 잰 정보비율과 평균 수익은 좋게 나온다.",
-                        "1장은 북을 끝까지 그대로 들고 간다고 가정한다. 손절이 걸리면 실제 하위 꼬리는 더 얕다.",
-                        "4장은 현재 북을 과거 전 기간 들고 있었다고 가정한 재현이다. 북이 실제로 바뀐 이력이 아니다.",
-                        "5장 가상 충격의 요인 설명력(R²)이 낮으면 방향 정도만 참고한다. 프리셋 값은 예시다.",
-                        "6장 분봉은 yfinance 기준이며 15분 정도 늦을 수 있다."],
-                       ["If the book was selected on recent performance, the information ratio and mean return "
-                        "measured over the same window look better than they should.",
-                        "Chapter 1 assumes the book is held to the end. Stop-losses would make the left tail shallower.",
-                        "Chapter 4 replays the current book over the full history; it is not the book's actual record.",
-                        "When factor R² is low, read Chapter 5 shocks for direction only. Preset values are examples.",
-                        "Chapter 6 bars come from yfinance and may lag by about 15 minutes."])]),
+                       ["최근 성적이 좋아 고른 종목이면 같은 구간으로 잰 정보비율과 평균 수익은 좋게 나온다.",
+                        "기간 끝까지 그대로 들고 간다고 가정한다. 손절이 걸리면 실제 하위 꼬리는 더 얕다.",
+                        "검증 탭은 현재 비중을 과거 전 기간 들고 있었다고 가정한 재현이다.",
+                        "요인 설명력(R²)이 낮으면 가상 충격은 방향 정도만 참고한다. 프리셋 값은 예시다.",
+                        "Yahoo Finance 기준. 분봉은 15분쯤 늦을 수 있고, 일봉은 1시간, 실적 일정은 6시간 캐시한다."],
+                       ["If the holdings were chosen on recent performance, in-sample information ratio and mean "
+                        "return look better than they should.",
+                        "Holdings are assumed unchanged to the end. Stop-losses would make the left tail shallower.",
+                        "The backtest replays today's weights over the full history.",
+                        "When factor R² is low, read hypothetical shocks for direction only. Presets are examples.",
+                        "Yahoo Finance. Intraday bars may lag ~15 minutes; daily prices are cached for an hour and "
+                        "earnings dates for six."])]),
           text=True, index_name=T("항목", "Item"))
 
-    h2(T("문제가 생겼을 때", "Troubleshooting"))
-    table(help_table(["가격을 못 받은 종목 경고", "실적 일정을 받지 못했다는 문장", "장중 분봉이 없다는 문장",
-                      "북 목록이 비어 있음", "지면 색·글꼴이 기본값으로 보임"],
-                     ["Missing-price warning", "Earnings calendar unavailable", "No intraday bars",
-                      "Empty book list", "Default colours and fonts"],
-                     [("원인과 조치", "Cause and fix",
-                       ["티커 철자를 확인한다. 야후 파이낸스 표기(예: 한국 종목은 005930.KS)를 쓴다.",
-                        "일시적 차단일 수 있다. 몇 분 뒤 C로 캐시를 지우고 다시 연다. 그동안 해당 종목의 실적 위험은 빠진다.",
-                        "장 시작 전·마감 직후·휴장일에는 정상이다.",
-                        "BOOK_LOG 환경변수로 북 기록 파일을 지정한다. 없으면 예시 북으로 열린다.",
-                        "저장소 폴더 밖에서 실행했다. 저장소 폴더로 이동한 뒤 다시 실행한다."],
-                       ["Check the ticker. Use Yahoo Finance symbols (e.g. 005930.KS for Korean listings).",
-                        "Likely a temporary block. Wait a few minutes, press C to clear the cache, and reload. Until then "
-                        "that holding's earnings risk is excluded.",
-                        "Normal before the open, right after the close, and on holidays.",
-                        "Point the BOOK_LOG environment variable to a log file. Without it, the sample books load.",
-                        "The app was started outside the repository folder. Start it from the repository folder."])]),
-          text=True, index_name=T("증상", "Symptom"))
+html_('<div class="q-foot">Risk Lab · ' + T("가격 자료: Yahoo Finance", "Prices: Yahoo Finance") +
+      ' · <a href="https://github.com/Giana0412/risk-lab" style="color:inherit">GitHub</a></div>')
