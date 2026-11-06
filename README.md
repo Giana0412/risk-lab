@@ -2,6 +2,8 @@
 
 **English** · [한국어](README.ko.md)
 
+**Live demo:** [giana-risk-lab.streamlit.app](https://giana-risk-lab.streamlit.app/?lang=en)
+
 A Streamlit app that reviews a long-only equity book the way a risk desk would, laid out as a research report.
 I built it while competing in the Bloomberg Global Trading Challenge, to check our team's model book every day.
 The competition ranks teams on return relative to a benchmark, so every measure is reported both in **absolute**

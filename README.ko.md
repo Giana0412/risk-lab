@@ -2,6 +2,8 @@
 
 [English](README.md) · **한국어**
 
+**라이브 데모:** [giana-risk-lab.streamlit.app](https://giana-risk-lab.streamlit.app/?lang=ko)
+
 주식 롱온리 북 하나를 실무 리스크 지표로 점검하는 Streamlit 앱이다.
 Bloomberg Global Trading Challenge에 참가하는 동안 팀의 모델 북을 매일 점검하려고 만들었다.
 대회는 벤치마크 대비 상대수익으로 순위를 매기므로, 모든 지표를 **절대**와 **벤치 대비** 두 가지로 낸다.
