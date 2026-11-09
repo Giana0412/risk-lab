@@ -11,7 +11,7 @@ A Streamlit app that shows where a stock portfolio could be in a few weeks.
   which stocks drive the swings, and what past crashes would have done to the same mix. Written for people with no
   finance background.
 - **"Show the detailed analysis" opens the risk-desk view**: VaR and ES across methods, backtests, stress tests,
-  intraday monitoring and liquidity. I first built it during the Bloomberg Global Trading Challenge to check our
+  performance attribution, intraday monitoring and liquidity. I first built it during the Bloomberg Global Trading Challenge to check our
   team's model book every day. The competition ranks teams on return relative to a benchmark, so this part reports
   every measure both in **absolute** terms and **relative to the benchmark**.
 
@@ -26,6 +26,7 @@ A Streamlit app that shows where a stock portfolio could be in a few weeks.
 | VaR | How much VaR depends on the method | Historical · variance-covariance · Cornish-Fisher · EWMA (RiskMetrics) · FHS-GARCH · Monte Carlo (normal / multivariate t) |
 | Backtest | Which method was actually right in the past | Rolling out-of-sample backtest; Kupiec POF, Christoffersen independence and conditional coverage; Basel traffic light |
 | Stress | What if a CPI surprise or a past crisis repeats | Replay of 5 CPI release days and 10 crisis windows (holdings not yet listed are proxied by beta); five-factor regression shocks |
+| Attribution | Why the mix beat or trailed the benchmark over the past 1–12 months | Buy-and-hold with drifting weights; per-holding contribution; Brinson-Fachler sector allocation vs selection (sector ETFs as benchmark sectors, benchmark weights rolled back from current fund data, reconstruction error shown); factor attribution with betas estimated before the period; Carino linking so every breakdown sums exactly to the active return |
 | Intraday | Where the book stands versus the benchmark right now | 5-minute relative return against VaR lines, refreshed every 60 seconds |
 | Liquidity | Can the book be exited quickly | Days to liquidate at a participation rate of average daily traded value |
 

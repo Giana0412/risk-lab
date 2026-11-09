@@ -613,3 +613,153 @@ def simulate_outcome(excess_ex: pd.Series, h: int, jumps: dict[str, tuple[float,
         if len(sample) >= MIN_JUMP_SAMPLES:  # 표본 1~3개면 분포가 아니라 점 몇 개다
             add += w * rng.choice(np.asarray(sample), n)
     return Outcome(base, base + add, jumps)
+
+
+# ── 성과 기여도 (attribution) ───────────────────────────────────────────
+# 질문: "이 비중으로 기간 초에 사서 들고 있었다면, 벤치보다 왜 이만큼 앞섰나/뒤졌나."
+# 규약
+# - 매매 없음(buy-and-hold). 비중은 가격을 따라 흘러간다 — drift_weights.
+# - 하루 단위로 나눈 뒤 **Carino 로그 연결**로 이어 붙인다. 일간 기여를 그냥 더하면
+#   합이 기간 초과수익(Π(1+r_p) − Π(1+r_b))과 맞지 않는다. 연결 후에는 정확히 맞는다.
+# - 모든 분해는 매일 Σ(항목) = r_p − r_b 가 되도록 짠다(잔차 항목을 명시해서).
+
+def drift_weights(rets: pd.DataFrame, w0: dict[str, float]) -> pd.DataFrame:
+    """각 날 **시작 시점**의 비중. 현금(1 − Σw)은 수익 0 으로 '현금' 열에 둔다."""
+    w = pd.Series(w0, dtype=float)
+    w = w[w.index.isin(rets.columns)]
+    R = rets[w.index].fillna(0.0)
+    val = (1 + R).cumprod().shift(1).fillna(1.0) * w          # 그날 시작 시점 평가액
+    cash = 1.0 - float(w.sum())
+    tot = val.sum(axis=1) + cash
+    out = val.div(tot, axis=0)
+    out["현금"] = cash / tot
+    return out
+
+
+def carino_scale(rp: pd.Series, rb: pd.Series) -> pd.Series:
+    """일간 기여에 곱할 연결 계수 k_t / K (Carino 1999). Σ_t (k_t/K)·(r_p,t − r_b,t) = R_p − R_b."""
+    def k(a, b):
+        a, b = np.asarray(a, float), np.asarray(b, float)
+        d = a - b
+        with np.errstate(divide="ignore", invalid="ignore"):
+            v = (np.log1p(a) - np.log1p(b)) / d
+        return np.where(np.abs(d) < 1e-12, 1.0 / (1.0 + a), v)
+    Rp, Rb = float((1 + rp).prod() - 1), float((1 + rb).prod() - 1)
+    K = float(k(Rp, Rb))
+    return pd.Series(k(rp.to_numpy(), rb.to_numpy()) / K, index=rp.index)
+
+
+def link(daily: pd.DataFrame, rp: pd.Series, rb: pd.Series) -> pd.Series:
+    """일간 기여 표(행=날, 열=항목)를 기간 기여로. 합 = 기간 초과수익."""
+    return daily.mul(carino_scale(rp, rb), axis=0).sum()
+
+
+def holding_attribution(rets: pd.DataFrame, w0: dict[str, float], bench_ret: pd.Series):
+    """종목별 기여: c_i,t = w_i,t·(r_i,t − r_b,t). 현금은 w_cash·(0 − r_b).
+    반환 (기간 기여 Series, r_p, r_b)."""
+    W = drift_weights(rets, w0)
+    names = [c for c in W.columns if c != "현금"]
+    rb = bench_ret.reindex(W.index).fillna(0.0)
+    R = rets[names].reindex(W.index).fillna(0.0)
+    rp = (W[names] * R).sum(axis=1)
+    daily = W[names] * R.sub(rb, axis=0)
+    daily["현금"] = W["현금"] * (0.0 - rb)
+    return link(daily, rp, rb), rp, rb
+
+
+def brinson_attribution(rets: pd.DataFrame, w0: dict[str, float], sectors: dict[str, str],
+                        bench_ret: pd.Series, bench_w: dict[str, float], sector_ret: pd.DataFrame):
+    """Brinson-Fachler 섹터 분해 (매일 계산 → Carino 연결).
+
+    배분_s = (w_p,s − w_b,s)·(r_b,s − r_b*)   벤치보다 많이 담은 섹터가 벤치보다 잘 갔나
+    선택_s =  w_p,s·(r_p,s − r_b,s)          그 섹터 안에서 고른 종목이 섹터보다 잘 갔나
+                                               (상호작용 항 포함 — 실무에서 흔히 합친다)
+    r_b* = Σ w_b,s,t·r_b,s 는 **섹터 ETF 로 다시 만든 벤치**다(w_b,s,t 는 끝 비중에서 되짚은 매일 비중). 실제 벤치와의 차이
+    (r_b* − r_b)는 '벤치 재구성 오차'로 따로 둔다 — 숨기면 합이 안 맞는다.
+    섹터 ETF 가 없는 섹터(분류 실패 등)의 종목은 r_b,s = r_b* 로 두어 배분 0, 선택만 잡힌다.
+    현금은 w_b = 0, 수익 0 인 섹터다.
+
+    반환 (섹터별 표, 기간 합계 dict)."""
+    W = drift_weights(rets, w0)
+    idx = W.index
+    rb = bench_ret.reindex(idx).fillna(0.0)
+    bw = pd.Series(bench_w, dtype=float)
+    bw = bw[bw.index.isin(sector_ret.columns) & (bw > 0)]
+    bw = bw / bw.sum()
+    SR = sector_ret[bw.index].reindex(idx).fillna(0.0)
+    # 벤치 섹터 비중은 **기간 끝의 현재값**만 안다. 시가총액 가중 벤치는 섹터 비중이 섹터 수익을
+    # 따라 흘러가므로, 끝 비중에서 거꾸로 되짚어 매일 시작 비중을 만든다: w_s,t ∝ w_s,끝 / Π_{u≥t}(1+r_s,u).
+    # 고정 비중을 1년 내내 쓰면 재구성 오차가 SPY 3.6%p·ACWI 4.6%p 였고, 되짚으면 1.4·2.5%p 로 준다(2026-11-09).
+    grow_after = (1 + SR)[::-1].cumprod()[::-1]
+    BW = (bw / grow_after)
+    BW = BW.div(BW.sum(axis=1), axis=0)
+    rb_star = (SR * BW).sum(axis=1)
+
+    names = [c for c in W.columns if c != "현금"]
+    R = rets[names].reindex(idx).fillna(0.0)
+    sec_of = {t: sectors.get(t) or "미분류" for t in names}
+    secs = sorted(set(sec_of.values()) | set(bw.index)) + ["현금"]
+    rp = (W[names] * R).sum(axis=1)
+
+    alloc, select, wp_s, rp_s = {}, {}, {}, {}
+    for s in secs:
+        if s == "현금":
+            w_s, r_s = W["현금"], pd.Series(0.0, index=idx)
+        else:
+            mem = [t for t in names if sec_of[t] == s]
+            w_s = W[mem].sum(axis=1) if mem else pd.Series(0.0, index=idx)
+            ret_contrib = (W[mem] * R[mem]).sum(axis=1) if mem else pd.Series(0.0, index=idx)
+            r_s = (ret_contrib / w_s).where(w_s > 0, 0.0)
+        # 현금의 '벤치 섹터 수익'은 0 이다 → 배분 = w_cash·(0 − r_b*). 벤치가 오르면 현금은 깎는다.
+        # (처음엔 SR 에 없는 섹터처럼 r_b* 를 넣어 현금 몫이 0 이 됐고, 합이 초과수익과 안 맞았다.)
+        rbs = pd.Series(0.0, index=idx) if s == "현금" else (SR[s] if s in SR.columns else rb_star)
+        w_b = BW[s] if s in BW.columns else 0.0
+        alloc[s] = (w_s - w_b) * (rbs - rb_star)
+        select[s] = w_s * (r_s - rbs) if s != "현금" else pd.Series(0.0, index=idx)
+        wp_s[s], rp_s[s] = w_s, r_s
+
+    A, S = pd.DataFrame(alloc), pd.DataFrame(select)
+    daily = pd.concat({"배분": A, "선택": S}, axis=1)
+    resid = rb_star - rb                                   # 매일: Σ배분+Σ선택 + 오차 = r_p − r_b
+    scale = carino_scale(rp, rb)
+    La = A.mul(scale, axis=0).sum()
+    Ls = S.mul(scale, axis=0).sum()
+    Lr = float((resid * scale).sum())
+
+    period = lambda x: float((1 + x).prod() - 1)
+    table_ = pd.DataFrame({
+        "북 비중": {s: float(wp_s[s].iloc[0]) for s in secs},
+        "벤치 비중": {s: float(BW[s].iloc[0]) if s in BW.columns else 0.0 for s in secs},   # 기간 초
+        "북 섹터 수익": {s: period(rp_s[s]) if float(wp_s[s].abs().sum()) > 0 else float("nan") for s in secs},
+        "벤치 섹터 수익": {s: period(SR[s]) if s in SR.columns else float("nan") for s in secs},
+        "배분": La, "선택": Ls,
+    })
+    table_["합계"] = table_["배분"] + table_["선택"]
+    table_ = table_[(table_["북 비중"] > 0) | (table_["벤치 비중"] > 0)]
+    totals = dict(북=period(rp), 벤치=period(rb), 재구성벤치=period(rb_star), 초과=period(rp) - period(rb),
+                  배분=float(La.sum()), 선택=float(Ls.sum()), 재구성오차=Lr)
+    return table_.sort_values("합계"), totals
+
+
+def factor_attribution(rets: pd.DataFrame, w0: dict[str, float], bench_ret: pd.Series,
+                       betas: pd.DataFrame, bench_betas: pd.Series, factors: pd.DataFrame):
+    """요인별 기여: 매일 (북 베타 − 벤치 베타)·요인수익, 나머지는 '종목 고유'.
+
+    🔴 베타는 **기간 시작 전** 자료로 추정해서 넘겨야 한다. 같은 기간으로 회귀하면 잔차가
+    정의상 평균 0 에 가깝게 맞춰져 '종목 고유'가 작아 보인다(표본내 과적합).
+    북 베타는 흘러가는 비중으로 매일 다시 가중한다. 현금 베타는 0.
+    반환 (기간 기여 Series: 요인들 + '종목 고유', 일간 활성 베타 평균 Series)."""
+    W = drift_weights(rets, w0)
+    idx = W.index
+    names = [c for c in W.columns if c != "현금" and c in betas.index]
+    fcols = [c for c in factors.columns if c in betas.columns and c in bench_betas.index]
+    F = factors[fcols].reindex(idx).fillna(0.0)
+    B = betas.loc[names, fcols]
+    beta_p = W[names].to_numpy() @ B.to_numpy()               # (일, 요인)
+    act = pd.DataFrame(beta_p - bench_betas[fcols].to_numpy(), index=idx, columns=fcols)
+    allnames = [c for c in W.columns if c != "현금"]
+    rp = (W[allnames] * rets[allnames].reindex(idx).fillna(0.0)).sum(axis=1)
+    rb = bench_ret.reindex(idx).fillna(0.0)
+    daily = act * F
+    daily["종목 고유"] = (rp - rb) - daily.sum(axis=1)
+    return link(daily, rp, rb), act.mean()

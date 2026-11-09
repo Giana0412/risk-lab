@@ -128,6 +128,11 @@ def cached_backtest(ser: pd.Series, alpha: float, window: int):
     return risk.backtest_var(ser, alpha, window)
 
 
+@st.cache_data(ttl=24 * 3600, show_spinner=T("섹터 정보를 받는 중…", "Downloading sector data…"))
+def get_sectors(tickers: tuple[str, ...], bench: str):
+    return {t: data.stock_sector(t) for t in tickers}, data.bench_sector_weights(bench)
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def get_intraday(tickers: tuple[str, ...]):
     return data.intraday_prices(list(tickers))
@@ -238,7 +243,10 @@ if bench not in close or close[bench].dropna().empty or not weights:
 fx = float(close[FX].dropna().iloc[-1]) if FX in close and close[FX].notna().any() else 1400.0
 nav_usd = nav / fx if ui.LANG == "ko" else nav  # 유동성 계산은 달러 거래대금과 비교한다
 
-rets_all = close.pct_change(fill_method=None)
+# 🔴 종목마다 **자기 거래일**로 수익률을 낸다. 표 전체로 pct_change 하면, 다른 열(환율 KRW=X,
+# 한국 주식)이 거래한 미국 휴장일에 빈칸이 생기고 그 **다음 날 수익률까지 NaN** 이 되어
+# dropna 로 사라진다 — 노동절 다음 날(2026-09-08)이 VaR 표본·기여도 기간에서 통째로 빠졌다.
+rets_all = close.apply(lambda s: s.dropna().pct_change(fill_method=None))
 hold = list(weights)
 cols = list(dict.fromkeys(hold + [bench]))  # 비교 지수를 종목으로도 담으면 열이 중복된다
 win = rets_all[cols].dropna().iloc[-lookback:]
@@ -492,9 +500,10 @@ with st.expander(T("계산 설정", "Calculation settings")):
     st.caption(T(f"비교 지수 {bench} · {len(hold)}종목 · 현금 {1 - sum(weights.values()):.1%} · 추정 구간 {len(win)}거래일",
                  f"Benchmark {bench} · {len(hold)} holdings · cash {1 - sum(weights.values()):.1%} · {len(win)}-day window"))
 
-tab_out, tab_sum, tab_var, tab_bt, tab_st, tab_live, tab_liq, tab_help = st.tabs([
+tab_out, tab_sum, tab_var, tab_bt, tab_st, tab_attr, tab_live, tab_liq, tab_help = st.tabs([
     T("전망", "Outlook"), T("리스크", "Risk"), T("VaR", "VaR"), T("검증", "Backtest"),
-    T("스트레스", "Stress"), T("장중", "Intraday"), T("유동성", "Liquidity"), T("읽는 법", "Guide")])
+    T("스트레스", "Stress"), T("기여도", "Attribution"), T("장중", "Intraday"), T("유동성", "Liquidity"),
+    T("읽는 법", "Guide")])
 
 # ════════════════════════════════════════════════════════════════════════
 # 1. 전망 / Outlook
@@ -1053,6 +1062,151 @@ with tab_liq:
            "Average daily value over the last 20 trading days. Transaction costs and slippage are not modelled."))
 
 # ════════════════════════════════════════════════════════════════════════
+# 성과 기여도 / Attribution
+# ════════════════════════════════════════════════════════════════════════
+
+with tab_attr:
+    ui.chapter(8)
+    A_PER = {21: T("1개월", "1 month"), 63: T("3개월", "3 months"), 126: T("6개월", "6 months"), 252: T("1년", "1 year")}
+    n_back = st.radio(T("돌아볼 기간", "Look-back period"), list(A_PER), index=1, horizontal=True,
+                      format_func=lambda k: A_PER[k], key="attr_period")
+    rr = rets_all[cols].dropna()
+    if len(rr) < n_back + 120:
+        p(T("이 기간을 나누기에는 함께 거래된 날이 모자란다. 기간을 줄이거나 최근 상장 종목을 빼 보라.",
+            "Not enough common trading history for this period. Shorten it or remove a recent listing."))
+    else:
+        per_idx = rr.index[-n_back:]
+        start, end = per_idx[0], per_idx[-1]
+        Rp_ = rets_all.loc[per_idx, hold]
+        rb_ = rets_all.loc[per_idx, bench]
+        hc, rp_, rbx = risk.holding_attribution(Rp_, weights, rb_)
+        P_, B_ = float((1 + rp_).prod() - 1), float((1 + rbx).prod() - 1)
+        ex_ = P_ - B_
+
+        # 섹터 분해 — 벤치 섹터 비중과 섹터 ETF 가 있어야 한다
+        etf_map = data.sector_etfs(bench)
+        secs_, bw_ = get_sectors(tuple(t for t in hold if t != bench), bench)
+        brin = None
+        if bw_:
+            etf_close, _ = get_daily(tuple(sorted(set(etf_map.values()))))
+            etf_r = etf_close.pct_change(fill_method=None)
+            SR_ = pd.DataFrame({k: etf_r[v] for k, v in etf_map.items() if v in etf_r}).reindex(per_idx)
+            if SR_.notna().all().any():
+                brin = risk.brinson_attribution(Rp_, weights, secs_, rb_, bw_, SR_.dropna(axis=1, how="all"))
+
+        # 요인 분해 — 베타는 기간 시작 **전** 250거래일로 추정한다
+        fac = data.factor_returns(close)
+        pre = rets_all.loc[:start].iloc[:-1]
+        est = pre[cols].dropna().iloc[-250:]
+        fb = risk.factor_betas(est, fac.reindex(est.index))
+        fct = None
+        if bench in fb.index and all(t in fb.index for t in hold if t != bench):
+            fct, act_beta = risk.factor_attribution(Rp_, weights, rb_, fb.drop(columns="R2"),
+                                                    fb.loc[bench].drop("R2"), fac.reindex(per_idx))
+
+        sec_name = lambda k: data.SECTOR_NAME.get(k, (k, k))[0 if ui.LANG == "ko" else 1]
+        lead = T("앞섰다", "beat") if ex_ >= 0 else T("뒤졌다", "trailed")
+        if brin is not None:
+            tab_b, tot_b = brin
+            big = T("섹터 배분", "sector allocation") if abs(tot_b["배분"]) >= abs(tot_b["선택"]) else T("종목 선택", "stock selection")
+            h2(T(f"지난 {A_PER[n_back]} {bench_name}보다 {pp(ex_)} {lead} — 더 큰 몫은 {big}",
+                 f"Over the past {A_PER[n_back]} the mix {lead} the {bench_name} by {pp(ex_)}, mostly through {big}"))
+        else:
+            h2(T(f"지난 {A_PER[n_back]} {bench_name}보다 {pp(ex_)} {lead}",
+                 f"Over the past {A_PER[n_back]} the mix {lead} the {bench_name} by {pp(ex_)}"))
+        top_c, bot_c = hc.drop("현금", errors="ignore").idxmax(), hc.drop("현금", errors="ignore").idxmin()
+        p(T(f"{start:%Y-%m-%d} 종가에 지금 비중으로 사서 {end:%Y-%m-%d}까지 그대로 들고 있었다고 보고 나눴다. "
+            f"북 {pct(P_, True, 1)}, {bench_name} {pct(B_, True, 1)}. 가장 많이 보탠 종목은 {top_c}({pp(hc[top_c])}), "
+            f"가장 많이 깎은 종목은 {bot_c}({pp(hc[bot_c])})다.",
+            f"Assumes today's weights were bought at the {start:%Y-%m-%d} close and held unchanged to {end:%Y-%m-%d}. "
+            f"Book {pct(P_, True, 1)}, {bench_name} {pct(B_, True, 1)}. The largest contributor was {top_c} "
+            f"({pp(hc[top_c])}); the largest detractor was {bot_c} ({pp(hc[bot_c])})."))
+        k_items = [(T("북 수익", "Book return"), pct(P_, True, 1), P_ < 0),
+                   (T("벤치 수익", "Benchmark return"), pct(B_, True, 1), B_ < 0),
+                   (T("초과수익", "Active return"), pp(ex_), ex_ < 0)]
+        if brin is not None:
+            k_items += [(T("섹터 배분", "Allocation"), pp(tot_b["배분"]), tot_b["배분"] < 0),
+                        (T("종목 선택", "Selection"), pp(tot_b["선택"]), tot_b["선택"] < 0)]
+        keys(k_items)
+
+        # 종목별 기여
+        figure(T("종목별 기여", "Contribution by holding"),
+               T("w·(종목 수익 − 벤치 수익)을 매일 계산해 이어 붙인 값. 합 = 초과수익",
+                 "Daily w·(holding return − benchmark return), linked over the period. Sum = active return"))
+        hh_ = hc[hc.abs() > 1e-6].sort_values()
+        lab_ = [T("현금", "Cash") if i == "현금" else i for i in hh_.index]
+        fig = go.Figure(go.Bar(y=lab_, x=hh_.values, orientation="h",
+                               marker_color=[ui.NEG_BAR if v < 0 else ui.POS_BAR for v in hh_.values],
+                               text=[pp(v) for v in hh_.values], textposition="outside", cliponaxis=False,
+                               hovertemplate="%{y} %{x:+.2%}<extra></extra>"))
+        span = float(hh_.abs().max()) * 1.35 or 0.01
+        fig.update_xaxes(range=[-span, span], tickformat=".1%", zeroline=True, zerolinecolor=ui.INK, zerolinewidth=1)
+        fig.update_yaxes(type="category", showgrid=False)
+        st.plotly_chart(ui.layout(fig, 60 + 32 * len(lab_), legend=False), width="stretch",
+                        config={"displayModeBar": False})
+        note(T("현금은 수익 0으로 본다. 벤치가 오른 기간에는 현금이 초과수익을 깎는다.",
+               "Cash earns zero, so it detracts when the benchmark rises."))
+
+        # 섹터 분해
+        if brin is not None:
+            c_wp, c_wb, c_rp, c_rb, c_al, c_se, c_tt = (
+                T("북 비중", "Book wt"), T("벤치 비중", "Bench wt"), T("북 섹터 수익", "Book sector ret"),
+                T("벤치 섹터 수익", "Bench sector ret"), T("배분", "Allocation"), T("선택", "Selection"),
+                T("합계", "Total"))
+            show = tab_b.rename(columns={"북 비중": c_wp, "벤치 비중": c_wb, "북 섹터 수익": c_rp,
+                                         "벤치 섹터 수익": c_rb, "배분": c_al, "선택": c_se, "합계": c_tt})
+            show.index = [sec_name(i) for i in show.index]
+            show = show.iloc[::-1]
+            table_title(T("섹터별 분해 (Brinson-Fachler)", "Sector attribution (Brinson-Fachler)"),
+                        T("배분 = 벤치보다 많이/적게 담은 섹터가 벤치 평균보다 잘/못 간 몫 · 선택 = 같은 섹터 안에서 고른 종목이 섹터보다 잘/못 간 몫",
+                          "Allocation: over/underweighting sectors that beat/lagged the benchmark · Selection: holdings beating/lagging their own sector"))
+            f_w = lambda v: "–" if pd.isna(v) or v == 0 else f"{v:.1%}"
+            f_r = lambda v: "–" if pd.isna(v) else pct(v, True, 1)
+            table(show, fmt={c_wp: f_w, c_wb: f_w, c_rp: f_r, c_rb: f_r, c_al: pp, c_se: pp, c_tt: pp},
+                  neg_cols=(c_al, c_se, c_tt), index_name=T("섹터", "Sector"))
+            note(T(f"섹터 수익은 {', '.join(sorted(set(etf_map.values())))} ETF로 대신했다. 벤치 섹터 비중은 Yahoo 펀드 자료의 현재 값에서 "
+                   f"섹터 수익으로 거꾸로 되짚어 매일 비중을 만들었다(표의 벤치 비중은 기간 초). 섹터 ETF로 다시 만든 벤치({pct(tot_b['재구성벤치'], True, 1)})와 실제 {bench}의 차이 "
+                   f"{pp(tot_b['재구성오차'])}는 '벤치 재구성 오차'로 남겼다 — 배분 {pp(tot_b['배분'])} + 선택 {pp(tot_b['선택'])} "
+                   f"+ 오차 {pp(tot_b['재구성오차'])} = 초과수익 {pp(ex_)}. 선택에는 상호작용 효과가 들어 있다.",
+                   f"Sector returns are proxied by the {', '.join(sorted(set(etf_map.values())))} ETFs; benchmark sector weights "
+                   f"start from Yahoo's current fund data and are rolled back through sector returns to get each day's weights "
+                   f"(the table shows the start of the period). The ETF-rebuilt benchmark returned "
+                   f"{pct(tot_b['재구성벤치'], True, 1)}; its gap to the actual {bench}, {pp(tot_b['재구성오차'])}, is shown as "
+                   f"reconstruction error: allocation {pp(tot_b['배분'])} + selection {pp(tot_b['선택'])} + error "
+                   f"{pp(tot_b['재구성오차'])} = active {pp(ex_)}. Selection includes the interaction term."))
+            if abs(tot_b["재구성오차"]) > max(0.01, 0.5 * abs(ex_)):
+                p(T(f"주의: 섹터 ETF로 다시 만든 벤치가 실제 {bench}와 {pp(tot_b['재구성오차'])} 어긋난다. 초과수익에 비해 큰 차이라 "
+                    "배분·선택의 크기는 방향 정도로만 읽어야 한다. 섹터 ETF의 종목 비중 상한과 지수 구성 차이 때문이며, "
+                    "기간이 길수록 커진다.",
+                    f"Caution: the ETF-rebuilt benchmark is off from the actual {bench} by {pp(tot_b['재구성오차'])}, large "
+                    "relative to the active return, so read the allocation and selection figures for direction only. The gap "
+                    "comes from sector-ETF weight caps and index construction differences, and grows with the period."))
+        else:
+            p(T(f"{bench}의 섹터 비중을 받지 못해 섹터별 분해는 건너뛰었다(ETF가 아닌 지수이거나 자료 없음).",
+                f"Sector weights for {bench} were unavailable (not a fund, or no data), so sector attribution is skipped."))
+
+        # 요인 분해
+        if fct is not None:
+            c_ab, c_fr, c_ct = T("활성 베타", "Active beta"), T("요인 수익", "Factor return"), T("기여", "Contribution")
+            fr_ = (1 + fac.reindex(per_idx)[act_beta.index].fillna(0.0)).prod() - 1
+            ft = pd.DataFrame({c_ab: act_beta, c_fr: fr_, c_ct: fct[act_beta.index]})
+            ft.loc[T("종목 고유", "Stock-specific")] = [np.nan, np.nan, fct["종목 고유"]]
+            if ui.LANG == "en":
+                ft.index = [{"시장(ACWI)": "Market (ACWI)", "소형주 스프레드(IWM−SPY)": "Small-cap spread (IWM−SPY)",
+                             "장기채(TLT)": "Long bonds (TLT)", "유가(USO)": "Oil (USO)", "달러(UUP)": "Dollar (UUP)"}.get(i, i)
+                            for i in ft.index]
+            table_title(T("요인별 분해", "Factor attribution"),
+                        T("기여 = (북 베타 − 벤치 베타) × 요인 수익을 매일 계산해 이은 값. 나머지가 종목 고유",
+                          "Contribution = (book beta − benchmark beta) × factor return, daily and linked. The rest is stock-specific"))
+            table(ft, fmt={c_ab: lambda v: "–" if pd.isna(v) else f"{v:+.2f}".replace("-", "−"), c_fr: lambda v: "–" if pd.isna(v) else pct(v, True, 1), c_ct: pp},
+                  neg_cols=(c_ct,), index_name=T("요인", "Factor"), em_rows=(T("종목 고유", "Stock-specific"),))
+            note(T(f"베타는 기간 시작 전 {len(est)}거래일로 추정했다. 같은 기간으로 추정하면 종목 고유 몫이 작게 나온다(표본내 과적합). "
+                   "종목 고유가 크면 초과수익은 시장·금리·유가 같은 공통 요인보다 개별 종목에서 나왔다는 뜻이다.",
+                   f"Betas are estimated on the {len(est)} trading days before the period. Estimating on the same period "
+                   "would shrink the stock-specific part (in-sample fit). A large stock-specific share means the active "
+                   "return came from the individual names rather than common factors."))
+
+# ════════════════════════════════════════════════════════════════════════
 # 읽는 법 / Guide
 # ════════════════════════════════════════════════════════════════════════
 
@@ -1065,25 +1219,29 @@ with tab_help:
                             index=index_ko if ui.LANG == "ko" else index_en)
 
     h2(T("탭별로 무엇을 보나", "What each tab answers"))
-    table(help_table(["전망", "리스크", "VaR", "검증", "스트레스", "장중", "유동성"],
-                     ["Outlook", "Risk", "VaR", "Backtest", "Stress", "Intraday", "Liquidity"],
+    table(help_table(["전망", "리스크", "VaR", "검증", "스트레스", "기여도", "장중", "유동성"],
+                     ["Outlook", "Risk", "VaR", "Backtest", "Stress", "Attribution", "Intraday", "Liquidity"],
                      [("답하는 질문", "Question",
                        ["남은 기간에 비교 지수를 이길 확률과 나쁠 때의 폭, 모형과 과거 실현치의 차이",
                         "하루 손실 규모와 위험을 많이 내는 종목",
                         "VaR가 계산 방법에 따라 얼마나 달라지나", "어떤 VaR 방법이 과거에 실제로 맞았나",
                         "CPI 발표일이나 과거 위기가 다시 오면, 요인 충격을 주면",
+                        "지난 기간 벤치보다 앞서거나 뒤진 이유: 섹터 배분, 종목 선택, 요인",
                         "지금 장중에 비교 지수 대비 어디쯤인가", "한 번에 다 팔 수 있나"],
                        ["Odds of beating the benchmark, how bad it gets, and model versus realized history",
                         "Size of a one-day loss and which holdings drive risk",
                         "How much VaR depends on the method", "Which VaR method was actually right in the past",
                         "What if a CPI surprise or a past crisis repeats; factor shocks",
+                        "Why the mix beat or trailed the benchmark: sector allocation, stock selection, factors",
                         "Where the book stands versus the benchmark right now", "Can the book be exited quickly"]),
                       ("먼저 볼 것", "Look first at",
                        ["하위 5%·1%와 분포 비교 표", "종목별 위험 기여 표의 배수", "방법별 VaR 그림의 점 간격",
-                        "사후검증 표의 판정 열", "위기 재현 그림의 붉은 막대", "VaR 선과의 거리", "청산 소요 열"],
+                        "사후검증 표의 판정 열", "위기 재현 그림의 붉은 막대", "배분·선택 합계와 종목 고유 몫",
+                        "VaR 선과의 거리", "청산 소요 열"],
                        ["5th/1st percentiles and the comparison table", "Multiples in the risk contribution table",
                         "Spread of points in the VaR-by-method chart", "Verdict column of the backtest table",
-                        "Red bars in the crisis replay", "Distance to the VaR lines", "Days-to-exit column"])]),
+                        "Red bars in the crisis replay", "Allocation vs selection totals and the stock-specific share",
+                        "Distance to the VaR lines", "Days-to-exit column"])]),
           text=True, index_name=T("탭", "Tab"))
     note(T("첫 화면의 금액은 절대수익(평균 0 가정), 이 탭들의 '벤치 대비'는 비교 지수를 뺀 상대수익이다. "
            "%p는 상대수익의 차이를 뜻한다.",

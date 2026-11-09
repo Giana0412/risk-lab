@@ -176,3 +176,83 @@ def test_nyse_calendar():
     import data
     d = data.trading_days("2026-11-20", "2026-12-04")
     assert pd.Timestamp("2026-11-26") not in d and pd.Timestamp("2026-11-27") in d and len(d) == 10
+
+
+# ── 성과 기여도 ──────────────────────────────────────────────────────────
+
+def _attr_data(n=60, seed=7):
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2026-01-01", periods=n)
+    R = pd.DataFrame(rng.normal(0.0005, 0.02, (n, 4)), index=idx, columns=["A", "B", "C", "D"])
+    secR = pd.DataFrame(rng.normal(0.0003, 0.01, (n, 3)), index=idx, columns=["tech", "fin", "energy"])
+    bench = 0.5 * secR["tech"] + 0.3 * secR["fin"] + 0.2 * secR["energy"] + rng.normal(0, 0.001, n)
+    return R, secR, bench
+
+
+def test_drift_weights_buy_and_hold():
+    R, _, _ = _attr_data()
+    w0 = {"A": 0.5, "B": 0.4}                      # 현금 10%
+    W = risk.drift_weights(R, w0)
+    assert abs(W.iloc[0]["A"] - 0.5) < 1e-12 and abs(W.iloc[0]["현금"] - 0.1) < 1e-12
+    assert np.allclose(W.sum(axis=1), 1.0)
+    # 매일 비중×수익을 복리로 이으면 실제 보유가치 변화와 같다
+    rp = (W[["A", "B"]] * R[["A", "B"]]).sum(axis=1)
+    val = 0.5 * (1 + R["A"]).prod() + 0.4 * (1 + R["B"]).prod() + 0.1
+    assert abs((1 + rp).prod() - val) < 1e-12
+
+
+def test_carino_link_sums_to_period_excess():
+    R, _, bench = _attr_data()
+    contrib, rp, rb = risk.holding_attribution(R, {"A": 0.3, "B": 0.3, "C": 0.2}, bench)
+    excess = (1 + rp).prod() - (1 + rb).prod()
+    assert abs(contrib.sum() - excess) < 1e-12
+
+
+def test_brinson_sums_and_pure_effects():
+    R, secR, bench = _attr_data()
+    w0 = {"A": 0.4, "B": 0.3, "C": 0.2, "D": 0.1}
+    sectors = {"A": "tech", "B": "tech", "C": "fin", "D": "unknown"}
+    tab, tot = risk.brinson_attribution(R, w0, sectors, bench, {"tech": 0.5, "fin": 0.3, "energy": 0.2}, secR)
+    assert abs(tot["배분"] + tot["선택"] + tot["재구성오차"] - tot["초과"]) < 1e-12
+    # 현금이 있어도 합이 맞아야 한다 (현금 배분 = w_cash·(0 − r_b*))
+    _, totc = risk.brinson_attribution(R, {"A": 0.3, "C": 0.2}, sectors, bench,
+                                       {"tech": 0.5, "fin": 0.3, "energy": 0.2}, secR)
+    assert abs(totc["배분"] + totc["선택"] + totc["재구성오차"] - totc["초과"]) < 1e-12
+    # 순수 배분: 종목 = 섹터 ETF 그대로면 선택 효과는 0
+    R2 = pd.DataFrame({"T": secR["tech"], "F": secR["fin"]})
+    tab2, tot2 = risk.brinson_attribution(R2, {"T": 0.8, "F": 0.2}, {"T": "tech", "F": "fin"},
+                                          bench, {"tech": 0.5, "fin": 0.3, "energy": 0.2}, secR)
+    assert abs(tot2["선택"]) < 1e-12
+    assert abs(tot2["배분"] + tot2["재구성오차"] - tot2["초과"]) < 1e-12
+    # 순수 선택: 벤치와 같은 섹터 비중이면 배분은 0 (섹터 수익 = ETF 일 때만 성립하지 않으므로 비중만 맞춘다)
+    R3 = pd.DataFrame({"T": secR["tech"] + 0.001, "F": secR["fin"], "E": secR["energy"]})
+    _, tot3 = risk.brinson_attribution(R3, {"T": 0.5, "F": 0.3, "E": 0.2}, {"T": "tech", "F": "fin", "E": "energy"},
+                                       bench, {"tech": 0.5, "fin": 0.3, "energy": 0.2}, secR)
+    assert tot3["선택"] > 0 and abs(tot3["배분"]) < 2e-3   # 비중이 흘러가 약간의 배분이 생긴다
+
+
+def test_brinson_bench_weights_drift_back_from_current():
+    """벤치가 섹터 ETF 의 시가총액 가중 합(매수 후 보유)이면, 끝 비중에서 되짚은 재구성 벤치는 정확히 같다."""
+    _, secR, _ = _attr_data()
+    w_start = pd.Series({"tech": 0.5, "fin": 0.3, "energy": 0.2})
+    val = (1 + secR).cumprod() * w_start
+    bench = val.sum(axis=1).pct_change().fillna(float((secR.iloc[0] * w_start).sum()))
+    w_end = (val.iloc[-1] / val.iloc[-1].sum()).to_dict()
+    R = pd.DataFrame({"T": secR["tech"]})
+    _, tot = risk.brinson_attribution(R, {"T": 1.0}, {"T": "tech"}, bench, w_end, secR)
+    assert abs(tot["재구성오차"]) < 1e-12
+
+
+def test_factor_attribution_sums_and_recovers_beta():
+    rng = np.random.default_rng(3)
+    idx = pd.bdate_range("2026-01-01", periods=80)
+    F = pd.DataFrame({"mkt": rng.normal(0, 0.01, 80), "size": rng.normal(0, 0.005, 80)}, index=idx)
+    R = pd.DataFrame({"A": 1.5 * F["mkt"] + rng.normal(0, 0.002, 80),
+                      "B": 0.5 * F["mkt"] + 1.0 * F["size"] + rng.normal(0, 0.002, 80)})
+    bench = F["mkt"]
+    betas = pd.DataFrame({"mkt": [1.5, 0.5], "size": [0.0, 1.0]}, index=["A", "B"])
+    contrib, act = risk.factor_attribution(R, {"A": 0.5, "B": 0.5}, bench, betas,
+                                           pd.Series({"mkt": 1.0, "size": 0.0}), F)
+    rp = (risk.drift_weights(R, {"A": .5, "B": .5})[["A", "B"]] * R).sum(axis=1)
+    assert abs(contrib.sum() - ((1 + rp).prod() - (1 + bench).prod())) < 1e-12
+    assert abs(act["mkt"]) < 0.1 and abs(act["size"] - 0.5) < 0.1

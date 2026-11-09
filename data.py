@@ -112,8 +112,63 @@ def intraday_prices(tickers: list[str], interval: str = "5m") -> pd.DataFrame:
 
 
 def factor_returns(close: pd.DataFrame) -> pd.DataFrame:
-    r = close[FACTOR_TICKERS].pct_change(fill_method=None)
+    # 자기 거래일 기준 수익률 — 표에 환율 같은 다른 달력의 열이 섞여 있으면 휴장 다음 날이 NaN 이 된다
+    r = close[FACTOR_TICKERS].apply(lambda s: s.dropna().pct_change(fill_method=None)).reindex(close.index)
     f = pd.DataFrame(index=r.index)
     for label, t in FACTOR_LABELS.items():
         f[label] = r["IWM"] - r["SPY"] if t is None else r[t]
     return f
+
+
+# ── 성과 기여도용: 섹터 ─────────────────────────────────────────────────
+# 종목 섹터는 Yahoo 분류(Morningstar 기반)를 쓴다. 섹터 ETF 는 GICS 를 따르므로 경계가
+# 약간 다르다(예: 일부 결제·인터넷 기업). 벤치 섹터 비중도 Yahoo 펀드 자료의 **현재** 값이라
+# 기간 내내 같다고 가정한다 — 그 차이는 '벤치 재구성 오차'로 드러난다(risk.brinson_attribution).
+SECTOR_KEY = {
+    "Technology": "technology", "Financial Services": "financial_services", "Healthcare": "healthcare",
+    "Consumer Cyclical": "consumer_cyclical", "Consumer Defensive": "consumer_defensive",
+    "Energy": "energy", "Industrials": "industrials", "Basic Materials": "basic_materials",
+    "Utilities": "utilities", "Real Estate": "realestate", "Communication Services": "communication_services",
+}
+SECTOR_NAME = {  # key → (한국어, English)
+    "technology": ("기술", "Technology"), "financial_services": ("금융", "Financials"),
+    "healthcare": ("헬스케어", "Health care"), "consumer_cyclical": ("경기소비재", "Consumer discretionary"),
+    "consumer_defensive": ("필수소비재", "Consumer staples"), "energy": ("에너지", "Energy"),
+    "industrials": ("산업재", "Industrials"), "basic_materials": ("소재", "Materials"),
+    "utilities": ("유틸리티", "Utilities"), "realestate": ("부동산", "Real estate"),
+    "communication_services": ("커뮤니케이션", "Communication"),
+    "미분류": ("미분류", "Unclassified"), "현금": ("현금", "Cash"),
+}
+# 미국 벤치(SPY·QQQ 등)는 SPDR 섹터 ETF, 전 세계 벤치(ACWI)는 iShares 글로벌 섹터 ETF
+SECTOR_ETF_US = {
+    "technology": "XLK", "financial_services": "XLF", "healthcare": "XLV", "consumer_cyclical": "XLY",
+    "consumer_defensive": "XLP", "energy": "XLE", "industrials": "XLI", "basic_materials": "XLB",
+    "utilities": "XLU", "realestate": "XLRE", "communication_services": "XLC",
+}
+SECTOR_ETF_GLOBAL = {
+    "technology": "IXN", "financial_services": "IXG", "healthcare": "IXJ", "consumer_cyclical": "RXI",
+    "consumer_defensive": "KXI", "energy": "IXC", "industrials": "EXI", "basic_materials": "MXI",
+    "utilities": "JXI", "realestate": "REET", "communication_services": "IXP",
+}
+GLOBAL_BENCHES = {"ACWI", "VT", "URTH"}
+
+
+def sector_etfs(bench: str) -> dict[str, str]:
+    return SECTOR_ETF_GLOBAL if bench in GLOBAL_BENCHES else SECTOR_ETF_US
+
+
+def stock_sector(t: str) -> str | None:
+    """Yahoo 섹터 → 키. ETF·실패는 None (기여도에서 '미분류'로 간다)."""
+    try:
+        return SECTOR_KEY.get(yf.Ticker(t).info.get("sector") or "")
+    except Exception:
+        return None
+
+
+def bench_sector_weights(bench: str) -> dict[str, float]:
+    """벤치(ETF)의 현재 섹터 비중. 펀드가 아니거나 못 받으면 빈 dict."""
+    try:
+        sw = yf.Ticker(bench).funds_data.sector_weightings or {}
+        return {k: float(v) for k, v in sw.items() if float(v) > 0}
+    except Exception:
+        return {}
