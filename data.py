@@ -172,3 +172,34 @@ def bench_sector_weights(bench: str) -> dict[str, float]:
         return {k: float(v) for k, v in sw.items() if float(v) > 0}
     except Exception:
         return {}
+
+
+# ── 무작위 포트폴리오 검정용 후보 종목 ──────────────────────────────────
+# S&P 500·400·600 구성종목과 GICS 섹터(위키백과, 2026-11 기준). 지금 구성종목이라
+# 과거 기간에는 살아남은 종목만 들어간다(생존 편향) — 한 달~1년 기간에서는 작다.
+UNIVERSE_CSV = Path(__file__).resolve().parent / "universe_sp1500.csv"
+GICS_KEY = {
+    "Information Technology": "technology", "Financials": "financial_services", "Health Care": "healthcare",
+    "Consumer Discretionary": "consumer_cyclical", "Consumer Staples": "consumer_defensive", "Energy": "energy",
+    "Industrials": "industrials", "Materials": "basic_materials", "Utilities": "utilities",
+    "Real Estate": "realestate", "Communication Services": "communication_services",
+}
+
+
+def load_universe(frac: float | None = None, min_per_sector: int = 20, seed: int = 7) -> pd.DataFrame:
+    """ticker · sector(키) · index('500'/'400'/'600').
+    frac 을 주면 섹터마다 그 비율만큼(최소 min_per_sector) 고정 시드로 뽑는다 — 섹터 구성비가 유지된다.
+    Yahoo 는 종목 하나에 요청 하나라 1,500종목을 다 받으면 4분 넘게 걸린다(2026-11 측정)."""
+    u = pd.read_csv(UNIVERSE_CSV, dtype=str)
+    u["sector"] = u["gics"].map(GICS_KEY)
+    u = u.dropna(subset=["sector"])[["ticker", "sector", "index"]]
+    if frac:
+        u = pd.concat([g.sample(min(len(g), max(min_per_sector, round(frac * len(g)))), random_state=seed)
+                       for _, g in u.groupby("sector")])
+    return u.sort_values("ticker").reset_index(drop=True)
+
+
+def universe_closes(tickers: list[str], start: str) -> pd.DataFrame:
+    """후보 종목의 수정종가(start 부터)."""
+    close, _ = daily_prices(tickers, start=start)
+    return close

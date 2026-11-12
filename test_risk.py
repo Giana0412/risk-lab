@@ -256,3 +256,42 @@ def test_factor_attribution_sums_and_recovers_beta():
     rp = (risk.drift_weights(R, {"A": .5, "B": .5})[["A", "B"]] * R).sum(axis=1)
     assert abs(contrib.sum() - ((1 + rp).prod() - (1 + bench).prod())) < 1e-12
     assert abs(act["mkt"]) < 0.1 and abs(act["size"] - 0.5) < 0.1
+
+
+# ── 매매 이력(blotter) ───────────────────────────────────────────────────
+
+def test_blotter_parse_and_rebuild_matches_pnl():
+    import blotter
+    text = """
+✓    Closed    X    AAA US    Long    110                1000    0    10    0    2026/01/07 22:30:00    2026/01/07 22:30:00    110    2026/01/05 22:30:00    100
+Open    X    BBB US    Long    55            5500    500    0    10    0    2026/01/07 21:00:00        2026/01/06 22:30:00    100
+"""
+    lots = blotter.parse_tmsg(text)
+    assert list(lots["bbg"]) == ["BBB US", "AAA US"] and lots["shares"].tolist() == [100, 100]
+    assert abs(lots.set_index("bbg").loc["AAA US", "entry_px"] - 100) < 1e-9
+    days = pd.bdate_range("2026-01-05", "2026-01-08")
+    close = pd.DataFrame({"AAA": [101, 104, 108, 109], "BBB": [50, 51, 53, 55]}, index=days, dtype=float)
+    opens = pd.DataFrame({"AAA": [100, 102, 110, 108], "BBB": [50, 50, 52, 54]}, index=days, dtype=float)
+    bk = blotter.build(lots, close, opens, days, notional=100_000)
+    got = bk.lots.set_index("bbg")["pnl_rebuilt"]
+    assert abs(got["AAA US"] - 1000) < 1e-9 and abs(got["BBB US"] - 500) < 1e-9
+    # 01-07 은 AAA 를 시가에 판다 → 그날 장중 구간에는 AAA 비중이 없다
+    pm = pd.Timestamp("2026-01-07 16:00")
+    assert bk.W.at[pm, "AAA#0"] == 0 and bk.W.at[pm, "BBB#1"] > 0
+    # Σ w·r = 순자산 변화
+    port = (bk.W.drop(columns="현금") * bk.R).sum(axis=1)
+    assert abs((1 + port).prod() * 100_000 - bk.nav.iloc[-1]) < 1e-6
+
+
+def test_random_portfolio_test():
+    cand = np.array([-0.10, 0.0, 0.10, 0.20, -0.05, 0.05])
+    w = {"A": 0.5, "B": 0.3, "ETF": 0.1}                       # 현금 0.1
+    own = pd.Series({"A": 0.20, "B": 0.05, "ETF": 0.02})
+    pools = {"A": np.array([0, 1, 2, 3]), "B": np.array([4, 5]), "ETF": None}
+    rt = risk.random_portfolio_test(w, own, pools, cand, n=50_000, seed=1)
+    assert abs(rt.actual - (0.5 * 0.20 + 0.3 * 0.05 + 0.1 * 0.02)) < 1e-12
+    # 기대값 = Σ w·(후보 평균) + 고정 종목
+    assert abs(rt.sims.mean() - (0.5 * 0.05 + 0.3 * 0.0 + 0.1 * 0.02)) < 2e-3
+    # A 는 후보 중 최고, B 는 위쪽 → 실제 이상인 경우는 (A=0.20, B=0.05) 뿐: 1/4 × 1/2
+    assert abs(rt.p_value - 0.125) < 0.01
+    assert rt.kept == ["ETF"] and rt.replaced == ["A", "B"]

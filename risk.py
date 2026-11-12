@@ -655,20 +655,33 @@ def link(daily: pd.DataFrame, rp: pd.Series, rb: pd.Series) -> pd.Series:
 
 
 def holding_attribution(rets: pd.DataFrame, w0: dict[str, float], bench_ret: pd.Series):
-    """종목별 기여: c_i,t = w_i,t·(r_i,t − r_b,t). 현금은 w_cash·(0 − r_b).
-    반환 (기간 기여 Series, r_p, r_b)."""
+    """종목별 기여 (고정 비중으로 사서 보유). 반환 (기간 기여 Series, r_p, r_b)."""
     W = drift_weights(rets, w0)
+    return holding_attribution_w(W, rets, bench_ret)
+
+
+def holding_attribution_w(W: pd.DataFrame, rets: pd.DataFrame, bench_ret: pd.Series):
+    """날짜별 비중 W(행=날, 열=종목·매매 단위, '현금' 열은 선택)로 종목별 기여를 낸다.
+    c_i,t = w_i,t·(r_i,t − r_b,t), 현금은 w_cash·(0 − r_b). 매매가 있는 실제 포트폴리오용."""
+    idx = W.index
     names = [c for c in W.columns if c != "현금"]
-    rb = bench_ret.reindex(W.index).fillna(0.0)
-    R = rets[names].reindex(W.index).fillna(0.0)
+    cash = W["현금"] if "현금" in W.columns else 1.0 - W[names].sum(axis=1)
+    rb = bench_ret.reindex(idx).fillna(0.0)
+    R = rets[names].reindex(idx).fillna(0.0)
     rp = (W[names] * R).sum(axis=1)
     daily = W[names] * R.sub(rb, axis=0)
-    daily["현금"] = W["현금"] * (0.0 - rb)
+    daily["현금"] = cash * (0.0 - rb)
     return link(daily, rp, rb), rp, rb
 
 
 def brinson_attribution(rets: pd.DataFrame, w0: dict[str, float], sectors: dict[str, str],
                         bench_ret: pd.Series, bench_w: dict[str, float], sector_ret: pd.DataFrame):
+    """고정 비중 버전 — drift 후 brinson_attribution_w."""
+    return brinson_attribution_w(drift_weights(rets, w0), rets, sectors, bench_ret, bench_w, sector_ret)
+
+
+def brinson_attribution_w(W: pd.DataFrame, rets: pd.DataFrame, sectors: dict[str, str],
+                          bench_ret: pd.Series, bench_w: dict[str, float], sector_ret: pd.DataFrame):
     """Brinson-Fachler 섹터 분해 (매일 계산 → Carino 연결).
 
     배분_s = (w_p,s − w_b,s)·(r_b,s − r_b*)   벤치보다 많이 담은 섹터가 벤치보다 잘 갔나
@@ -679,9 +692,10 @@ def brinson_attribution(rets: pd.DataFrame, w0: dict[str, float], sectors: dict[
     섹터 ETF 가 없는 섹터(분류 실패 등)의 종목은 r_b,s = r_b* 로 두어 배분 0, 선택만 잡힌다.
     현금은 w_b = 0, 수익 0 인 섹터다.
 
-    반환 (섹터별 표, 기간 합계 dict)."""
-    W = drift_weights(rets, w0)
+    반환 (섹터별 표, 기간 합계 dict). W 는 날짜별 비중('현금' 열 선택)."""
     idx = W.index
+    if "현금" not in W.columns:
+        W = W.assign(현금=1.0 - W.sum(axis=1))
     rb = bench_ret.reindex(idx).fillna(0.0)
     bw = pd.Series(bench_w, dtype=float)
     bw = bw[bw.index.isin(sector_ret.columns) & (bw > 0)]
@@ -728,8 +742,8 @@ def brinson_attribution(rets: pd.DataFrame, w0: dict[str, float], sectors: dict[
 
     period = lambda x: float((1 + x).prod() - 1)
     table_ = pd.DataFrame({
-        "북 비중": {s: float(wp_s[s].iloc[0]) for s in secs},
-        "벤치 비중": {s: float(BW[s].iloc[0]) if s in BW.columns else 0.0 for s in secs},   # 기간 초
+        "북 비중": {s: float(wp_s[s].mean()) for s in secs},          # 기간 평균
+        "벤치 비중": {s: float(BW[s].mean()) if s in BW.columns else 0.0 for s in secs},     # 기간 평균
         "북 섹터 수익": {s: period(rp_s[s]) if float(wp_s[s].abs().sum()) > 0 else float("nan") for s in secs},
         "벤치 섹터 수익": {s: period(SR[s]) if s in SR.columns else float("nan") for s in secs},
         "배분": La, "선택": Ls,
@@ -743,13 +757,20 @@ def brinson_attribution(rets: pd.DataFrame, w0: dict[str, float], sectors: dict[
 
 def factor_attribution(rets: pd.DataFrame, w0: dict[str, float], bench_ret: pd.Series,
                        betas: pd.DataFrame, bench_betas: pd.Series, factors: pd.DataFrame):
+    """고정 비중 버전 — drift 후 factor_attribution_w."""
+    return factor_attribution_w(drift_weights(rets, w0), rets, bench_ret, betas, bench_betas, factors)
+
+
+def factor_attribution_w(W: pd.DataFrame, rets: pd.DataFrame, bench_ret: pd.Series,
+                         betas: pd.DataFrame, bench_betas: pd.Series, factors: pd.DataFrame):
     """요인별 기여: 매일 (북 베타 − 벤치 베타)·요인수익, 나머지는 '종목 고유'.
 
     🔴 베타는 **기간 시작 전** 자료로 추정해서 넘겨야 한다. 같은 기간으로 회귀하면 잔차가
     정의상 평균 0 에 가깝게 맞춰져 '종목 고유'가 작아 보인다(표본내 과적합).
     북 베타는 흘러가는 비중으로 매일 다시 가중한다. 현금 베타는 0.
-    반환 (기간 기여 Series: 요인들 + '종목 고유', 일간 활성 베타 평균 Series)."""
-    W = drift_weights(rets, w0)
+    반환 (기간 기여 Series: 요인들 + '종목 고유', 일간 활성 베타 평균 Series).
+    betas 의 행은 W 의 열 이름이다(매매 단위별로 넘기면 된다). 베타가 없는 열은 요인 노출 0 으로
+    보고 그 수익은 전부 '종목 고유'로 간다."""
     idx = W.index
     names = [c for c in W.columns if c != "현금" and c in betas.index]
     fcols = [c for c in factors.columns if c in betas.columns and c in bench_betas.index]
@@ -763,3 +784,44 @@ def factor_attribution(rets: pd.DataFrame, w0: dict[str, float], bench_ret: pd.S
     daily = act * F
     daily["종목 고유"] = (rp - rb) - daily.sum(axis=1)
     return link(daily, rp, rb), act.mean()
+
+
+# ── 무작위 포트폴리오 검정 ────────────────────────────────────────────────
+# 기여도 분해는 '어디서' 초과수익이 났는지는 말해 주지만, 그게 **실력인지 운인지**는 말하지 않는다.
+# 같은 비중·같은 기간에 종목만 무작위로(같은 섹터 안에서) 바꾼 포트폴리오를 수만 개 만들어,
+# 실제 포트폴리오가 그 분포의 어디에 서는지 본다(Burns 2004, 'Random portfolios for evaluating
+# trading strategies'; Dawson & Young 2003). 분포의 위쪽 꼬리에 있어야 종목 고르기에 실력이 있다고
+# 말할 수 있다. 섹터를 묶으면 섹터 배분 효과는 빼고 '섹터 안 종목 선택'만 검정한다.
+
+@dataclass
+class RandomTest:
+    actual: float          # 실제 포트폴리오 기간 수익
+    sims: np.ndarray       # 무작위 포트폴리오 기간 수익들
+    pct: float             # 실제보다 낮은 무작위 비율 (= 백분위)
+    p_value: float         # 실제 이상인 무작위 비율 (한쪽 검정)
+    replaced: list         # 무작위로 바꾼 종목
+    kept: list             # 그대로 둔 종목(ETF·해외·분류 없음)
+
+
+def random_portfolio_test(weights: dict[str, float], own: pd.Series, pools: dict[str, np.ndarray | None],
+                          cand: np.ndarray, n: int = 20_000, seed: int = 0) -> RandomTest:
+    """weights: 종목 → 시작 비중(합 ≤ 1, 나머지는 현금 수익 0).
+    own: 종목 → 실제 기간 수익(사서 그대로 보유).  cand: 후보 종목들의 같은 기간 수익.
+    pools: 종목 → 바꿔 넣을 후보의 위치(cand 인덱스). None 이면 그 종목은 그대로 둔다.
+    사서 보유하면 기간 수익 = Σ w·R 이 정확하므로(비중 표류 포함) 날마다 다시 계산할 필요가 없다."""
+    rng = np.random.default_rng(seed)
+    tick = list(weights)
+    w = np.array([weights[t] for t in tick])
+    R = np.array([float(own[t]) for t in tick])
+    actual = float(w @ R)
+    sims = np.zeros(n)
+    replaced, kept = [], []
+    for wi, Ri, t in zip(w, R, tick):
+        pool = pools.get(t)
+        if pool is None or len(pool) == 0:
+            sims += wi * Ri
+            kept.append(t)
+        else:
+            sims += wi * cand[rng.choice(pool, n)]
+            replaced.append(t)
+    return RandomTest(actual, sims, float((sims < actual).mean()), float((sims >= actual).mean()), replaced, kept)

@@ -133,6 +133,15 @@ def get_sectors(tickers: tuple[str, ...], bench: str):
     return {t: data.stock_sector(t) for t in tickers}, data.bench_sector_weights(bench)
 
 
+@st.cache_data(ttl=24 * 3600, show_spinner=T("후보 종목 가격을 받는 중… 1분 반쯤 걸린다.",
+                                              "Downloading candidate prices… about 90 seconds."))
+def get_universe(start: str, asof: str):
+    """asof 는 캐시 키로만 쓴다 — 주가 자료에 새 날이 붙으면 후보 가격도 다시 받는다.
+    S&P 1500 을 섹터 비율대로 1/3 만 뽑는다(전부 받으면 4분 넘게 걸린다)."""
+    u = data.load_universe(frac=1 / 3)
+    return u, data.universe_closes(u["ticker"].tolist(), start)
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def get_intraday(tickers: tuple[str, ...]):
     return data.intraday_prices(list(tickers))
@@ -1165,12 +1174,12 @@ with tab_attr:
             table(show, fmt={c_wp: f_w, c_wb: f_w, c_rp: f_r, c_rb: f_r, c_al: pp, c_se: pp, c_tt: pp},
                   neg_cols=(c_al, c_se, c_tt), index_name=T("섹터", "Sector"))
             note(T(f"섹터 수익은 {', '.join(sorted(set(etf_map.values())))} ETF로 대신했다. 벤치 섹터 비중은 Yahoo 펀드 자료의 현재 값에서 "
-                   f"섹터 수익으로 거꾸로 되짚어 매일 비중을 만들었다(표의 벤치 비중은 기간 초). 섹터 ETF로 다시 만든 벤치({pct(tot_b['재구성벤치'], True, 1)})와 실제 {bench}의 차이 "
+                   f"섹터 수익으로 거꾸로 되짚어 매일 비중을 만들었다(표의 비중은 기간 평균). 섹터 ETF로 다시 만든 벤치({pct(tot_b['재구성벤치'], True, 1)})와 실제 {bench}의 차이 "
                    f"{pp(tot_b['재구성오차'])}는 '벤치 재구성 오차'로 남겼다 — 배분 {pp(tot_b['배분'])} + 선택 {pp(tot_b['선택'])} "
                    f"+ 오차 {pp(tot_b['재구성오차'])} = 초과수익 {pp(ex_)}. 선택에는 상호작용 효과가 들어 있다.",
                    f"Sector returns are proxied by the {', '.join(sorted(set(etf_map.values())))} ETFs; benchmark sector weights "
                    f"start from Yahoo's current fund data and are rolled back through sector returns to get each day's weights "
-                   f"(the table shows the start of the period). The ETF-rebuilt benchmark returned "
+                   f"(the table shows period averages). The ETF-rebuilt benchmark returned "
                    f"{pct(tot_b['재구성벤치'], True, 1)}; its gap to the actual {bench}, {pp(tot_b['재구성오차'])}, is shown as "
                    f"reconstruction error: allocation {pp(tot_b['배분'])} + selection {pp(tot_b['선택'])} + error "
                    f"{pp(tot_b['재구성오차'])} = active {pp(ex_)}. Selection includes the interaction term."))
@@ -1206,6 +1215,81 @@ with tab_attr:
                    "would shrink the stock-specific part (in-sample fit). A large stock-specific share means the active "
                    "return came from the individual names rather than common factors."))
 
+        # 실력인가 운인가 — 무작위 포트폴리오
+        table_title(T("실력인가 운인가", "Skill or luck?"),
+                    T("같은 비중·같은 기간에 종목만 무작위로 바꾼 포트폴리오 2만 개와 비교한다",
+                      "Compares the mix with 20,000 portfolios that keep the weights and period but swap the stocks at random"))
+        if st.toggle(T("무작위 포트폴리오와 비교하기 (후보 종목을 받느라 처음 한 번은 1분 반쯤 걸린다)",
+                       "Compare with random portfolios (downloads candidate stocks; the first run takes about 90 seconds)"),
+                     key="attr_rand"):
+            try:
+                uni_, ucl_ = get_universe(f"{pd.Timestamp.today() - pd.Timedelta(days=400):%Y-%m}-01", f"{end:%Y-%m-%d}")
+            except Exception as e:
+                uni_ = None
+                p(T(f"후보 종목 가격을 받지 못했다({type(e).__name__}). 잠시 뒤 다시 켜 보라.",
+                    f"Could not download the candidate stocks ({type(e).__name__}). Try again shortly."))
+            if uni_ is not None:
+                prev_ = ucl_.index[ucl_.index < start]
+                ok_ = ucl_.loc[per_idx[0]:end] if len(prev_) else ucl_.iloc[0:0]
+                if len(prev_) == 0 or ok_.empty or end not in ucl_.index:
+                    p(T("후보 종목 가격이 이 기간을 덮지 못한다.", "Candidate prices do not cover this period."))
+                else:
+                    base_ = ucl_.loc[prev_[-1]]
+                    full_ = ucl_.reindex([prev_[-1]] + list(per_idx)).notna().all()
+                    cr_ = (ucl_.loc[end] / base_ - 1)[full_]
+                    cr_ = cr_[cr_.index.isin(uni_.ticker)]
+                    usec_ = uni_.set_index("ticker").loc[cr_.index, "sector"].to_numpy()
+                    cand_ = cr_.to_numpy()
+                    own_ = (1 + Rp_.fillna(0.0)).prod() - 1
+                    us_ = lambda t: t != bench and "." not in t and t.isascii()
+                    all_idx = np.arange(len(cand_))
+                    rows_, sims_sec = {}, None
+                    for lab_k, pick in [(T("S&P 1500 아무 종목", "Any S&P 1500 stock"),
+                                         lambda t: all_idx if us_(t) and secs_.get(t) else None),
+                                        (T("같은 섹터 종목", "Same-sector stocks"),
+                                         lambda t: np.where(usec_ == secs_.get(t))[0] if us_(t) and secs_.get(t) else None)]:
+                        rt_ = risk.random_portfolio_test(weights, own_, {t: pick(t) for t in weights}, cand_)
+                        rows_[lab_k] = [1 - rt_.pct, rt_.p_value, float(np.median(rt_.sims)),
+                                        float(np.percentile(rt_.sims, 5)), float(np.percentile(rt_.sims, 95))]
+                        sims_sec = rt_
+                    rt_ = sims_sec
+                    if not rt_.replaced:
+                        p(T("바꿔 넣을 수 있는 미국 개별 종목이 없어 검정을 건너뛰었다(ETF·해외 종목은 그대로 둔다).",
+                            "No US single stocks to swap, so the test is skipped (ETFs and non-US listings stay fixed)."))
+                    else:
+                        top_ = 1 - rt_.pct
+                        verdict = (T("운만으로는 잘 나오지 않는 성과다", "hard to get by luck alone") if rt_.p_value < 0.05
+                                   else T("운과 구별되지 않는다", "indistinguishable from luck"))
+                        p(T(f"같은 섹터에서 아무 종목이나 골랐어도 {top_:.0%}는 실제보다 잘 했다(p = {rt_.p_value:.2f}) — {verdict}. "
+                            f"실제 {pct(rt_.actual, True, 1)}, 무작위 중앙값 {pct(float(np.median(rt_.sims)), True, 1)}.",
+                            f"Picking any stocks from the same sectors would have beaten the mix {top_:.0%} of the time "
+                            f"(p = {rt_.p_value:.2f}) — {verdict}. Actual {pct(rt_.actual, True, 1)}, random median "
+                            f"{pct(float(np.median(rt_.sims)), True, 1)}."))
+                        fig = go.Figure(go.Histogram(x=rt_.sims, nbinsx=60, marker_color=ui.MUTED,
+                                                     hovertemplate="%{x:.1%}: %{y}<extra></extra>"))
+                        fig.add_vline(x=rt_.actual, line_color=ui.POS_BAR if rt_.actual >= 0 else ui.NEG_BAR, line_width=2,
+                                      annotation_text=T("실제", "Actual"), annotation_position="top")
+                        fig.update_xaxes(tickformat=".0%")
+                        fig.update_yaxes(showticklabels=False, showgrid=False)
+                        st.plotly_chart(ui.layout(fig, 220, legend=False), width="stretch", config={"displayModeBar": False})
+                        c_top, c_pv, c_med, c_lo, c_hi = (T("실제보다 잘 한 비율", "Share beating the mix"), T("p값", "p-value"),
+                                                          T("무작위 중앙값", "Random median"), T("하위 5%", "5th pct"),
+                                                          T("상위 5%", "95th pct"))
+                        rt_tab = pd.DataFrame.from_dict(rows_, orient="index", columns=[c_top, c_pv, c_med, c_lo, c_hi])
+                        f_r1 = lambda v: pct(v, True, 1)
+                        table(rt_tab, fmt={c_top: lambda v: f"{v:.0%}", c_pv: lambda v: f"{v:.2f}", c_med: f_r1, c_lo: f_r1, c_hi: f_r1},
+                              index_name=T("바꿔 넣은 후보", "Swapped from"))
+                        note(T(f"미국 개별 종목 {len(rt_.replaced)}개만 바꾸고, ETF·해외 종목({', '.join(rt_.kept) or '없음'})과 현금은 그대로 뒀다. "
+                               f"후보는 S&P 500·400·600 현재 구성종목에서 섹터 비율대로 1/3을 뽑아 이 기간 내내 거래된 {len(cand_):,}개이고, 섹터는 GICS다(보유 종목은 Yahoo 분류라 경계가 조금 다르다). "
+                               "지금 구성종목이라 이 기간에 빠진 종목이 없다(생존 편향). 실제 포트폴리오가 무작위 분포의 위쪽 5% 안에 들어야(p < 0.05) "
+                               "종목 고르기에 실력이 있다고 말할 수 있다. 기간이 짧고 종목이 적을수록 그 문턱을 넘기 어렵다.",
+                               f"Only the {len(rt_.replaced)} US single stocks are swapped; ETFs and non-US listings "
+                               f"({', '.join(rt_.kept) or 'none'}) and cash stay fixed. Candidates are {len(cand_):,} stocks drawn as a sector-proportional third of the current "
+                               "S&P 500/400/600 members that traded throughout the period, grouped by GICS sector (holdings use Yahoo's classification, so the borders "
+                               "differ slightly). Using current members leaves out stocks that dropped out (survivorship bias). The mix needs to "
+                               "sit in the top 5% of the random distribution (p < 0.05) before stock picking can be called skill; short periods "
+                               "and few holdings make that bar hard to clear."))
+
 # ════════════════════════════════════════════════════════════════════════
 # 읽는 법 / Guide
 # ════════════════════════════════════════════════════════════════════════
@@ -1226,21 +1310,21 @@ with tab_help:
                         "하루 손실 규모와 위험을 많이 내는 종목",
                         "VaR가 계산 방법에 따라 얼마나 달라지나", "어떤 VaR 방법이 과거에 실제로 맞았나",
                         "CPI 발표일이나 과거 위기가 다시 오면, 요인 충격을 주면",
-                        "지난 기간 벤치보다 앞서거나 뒤진 이유: 섹터 배분, 종목 선택, 요인",
+                        "지난 기간 벤치보다 앞서거나 뒤진 이유: 섹터 배분, 종목 선택, 요인. 그게 실력인지 운인지",
                         "지금 장중에 비교 지수 대비 어디쯤인가", "한 번에 다 팔 수 있나"],
                        ["Odds of beating the benchmark, how bad it gets, and model versus realized history",
                         "Size of a one-day loss and which holdings drive risk",
                         "How much VaR depends on the method", "Which VaR method was actually right in the past",
                         "What if a CPI surprise or a past crisis repeats; factor shocks",
-                        "Why the mix beat or trailed the benchmark: sector allocation, stock selection, factors",
+                        "Why the mix beat or trailed the benchmark: sector allocation, stock selection, factors; skill or luck",
                         "Where the book stands versus the benchmark right now", "Can the book be exited quickly"]),
                       ("먼저 볼 것", "Look first at",
                        ["하위 5%·1%와 분포 비교 표", "종목별 위험 기여 표의 배수", "방법별 VaR 그림의 점 간격",
-                        "사후검증 표의 판정 열", "위기 재현 그림의 붉은 막대", "배분·선택 합계와 종목 고유 몫",
+                        "사후검증 표의 판정 열", "위기 재현 그림의 붉은 막대", "배분·선택 합계와 종목 고유 몫, 무작위 검정의 p값",
                         "VaR 선과의 거리", "청산 소요 열"],
                        ["5th/1st percentiles and the comparison table", "Multiples in the risk contribution table",
                         "Spread of points in the VaR-by-method chart", "Verdict column of the backtest table",
-                        "Red bars in the crisis replay", "Allocation vs selection totals and the stock-specific share",
+                        "Red bars in the crisis replay", "Allocation vs selection totals, the stock-specific share, the random-test p-value",
                         "Distance to the VaR lines", "Days-to-exit column"])]),
           text=True, index_name=T("탭", "Tab"))
     note(T("첫 화면의 금액은 절대수익(평균 0 가정), 이 탭들의 '벤치 대비'는 비교 지수를 뺀 상대수익이다. "
