@@ -279,15 +279,30 @@ def mcneil_frey(real, var, es, sigma, n_boot: int = 2000, seed: int = 0) -> tupl
     return float(res.mean()), float((1 + (tb >= t).sum()) / (n_boot + 1)), k
 
 
+GARCH_WINDOW = 500   # GARCH 계열 모수 추정 창 (backtest_var 설명 참고)
+
+
 def backtest_var(r: pd.Series, alpha: float = 0.99, window: int = 250, refit: int = 20,
-                 n_sim: int = 2000, seed: int = 0) -> Backtest:
+                 n_sim: int = 2000, seed: int = 0, garch_window: int | None = GARCH_WINDOW) -> Backtest:
     """롤링 창으로 매일 '어제까지의 데이터'로 오늘 VaR·ES 를 예측하고 위반을 센다.
     바젤 신호등: 250일 99% 기준 위반 0–4 녹색 · 5–9 황색 · 10+ 적색.
-    n_sim: Z2 p값용 귀무 시뮬레이션 횟수 (0 이면 Z2 p 생략). seed 로 재현된다."""
+    n_sim: Z2 p값용 귀무 시뮬레이션 횟수 (0 이면 Z2 p 생략). seed 로 재현된다.
+
+    garch_window: GARCH 계열(FHS-GARCH·GARCH-t) 모수 추정에 쓰는 창. None 이면 window 와 같다.
+      250일로는 GARCH-t 의 σ 가 4–5% 낮게, ν 가 들쭉날쭉하게 추정돼(소표본 효과) 모형이 맞아도
+      99% 에서 과소 커버한다 — 500일이면 명목 수준에 가깝다. 나머지 방법은 window 그대로 쓴다.
+      FHS-GARCH 도 긴 창을 쓴다: 99% 분위수를 잔차 250개(꼬리 2–3점) 대신 500개에서 잡는 편이 낫다.
+      t-GARCH 모의자료 20개(2,500일, ν=5)에서 99% Kupiec 기각률 — GARCH-t 15%→5%,
+      FHS-GARCH 40%→20% (FHS 만 250일로 두면 50%). 97.5% 는 FHS 20%→0%.
+    검정 기간은 모든 방법이 같다: 예측은 max(window, garch_window) 번째 날부터 시작하고, 그 앞의
+      날은 어느 방법도 채점하지 않는다. 그래서 방법 간 비교는 같은 날짜끼리의 짝 비교로 남는다
+      (대신 garch_window 가 길면 같은 데이터에서 검정일 수가 그만큼 줄어든다)."""
     r = r.dropna()
     x = r.to_numpy()
-    n = len(r) - window
-    idx = r.index[window:]
+    gw = int(garch_window or window)
+    start = max(window, gw)
+    n = len(r) - start
+    idx = r.index[start:]
     names = list(METHODS) + ["FHS-GARCH", "GARCH-t"]
     V, E, S = ({m: np.empty(n) for m in names} for _ in range(3))
     ew = ewma_vol(r).to_numpy()            # ew[t] 는 t-1 까지로 만든 예측
@@ -296,24 +311,26 @@ def backtest_var(r: pd.Series, alpha: float = 0.99, window: int = 250, refit: in
     tz = _tail_z(alpha)
     # 귀무분포 시뮬레이션에 쓸 그날의 예측분포 모수
     mu_w, sd_w, sk_w, ku_w, mu_g, mu_t, nu_t = (np.empty(n) for _ in range(7))
-    fz = np.empty((n, window))             # FHS 가 그날 쓴 표준화 잔차
+    fz = np.empty((n, gw))                 # FHS 가 그날 쓴 표준화 잔차
     g = gt = None
     for i in range(n):
-        t = window + i
+        t = start + i
         past = r.iloc[t - window:t]
         pv = past.to_numpy()
+        gpast = r.iloc[t - gw:t]            # GARCH 계열의 (더 긴) 추정 창
         if g is None or i % refit == 0:     # 모수만 20일마다 — σ 는 매일 갱신
-            gr = _grid(past)
-            g, gt = garch_fit(past, gr), garch_t_fit(past, gr)
+            gr = _grid(gpast)
+            g, gt = garch_fit(gpast, gr), garch_t_fit(gpast, gr)
             qt, et = t_std_var_es(alpha, gt.nu)
-        xp = pv - g.mu
+        gv = gpast.to_numpy()
+        xp = gv - g.mu
         s2, nxt, _ = _filter(xp, g.omega, g.alpha, g.beta, float(xp.var()))
         z, sn = xp / np.sqrt(s2), math.sqrt(nxt)
         qz = np.quantile(z, 1 - alpha)
         V["FHS-GARCH"][i], E["FHS-GARCH"][i], S["FHS-GARCH"][i] = \
             -(g.mu + qz * sn), -(g.mu + z[z <= qz].mean() * sn), sn
         fz[i], mu_g[i] = z, g.mu
-        xt = pv - gt.mu
+        xt = gv - gt.mu
         _, nxt, _ = _filter(xt, gt.omega, gt.alpha, gt.beta, float(xt.var()))
         st_ = math.sqrt(nxt)
         V["GARCH-t"][i], E["GARCH-t"][i], S["GARCH-t"][i] = -gt.mu + qt * st_, -gt.mu + et * st_, st_
@@ -329,9 +346,9 @@ def backtest_var(r: pd.Series, alpha: float = 0.99, window: int = 250, refit: in
     def null_draws(name: str, rng: np.random.Generator, k: int) -> np.ndarray:
         """그 방법이 맞다고 할 때의 실현 수익률 k 세트 (날짜 × k)."""
         if name == "역사적":
-            return x[np.arange(n)[:, None] + rng.integers(0, window, (n, k))]
+            return x[(start - window + np.arange(n))[:, None] + rng.integers(0, window, (n, k))]
         if name == "FHS-GARCH":
-            return mu_g[:, None] + S[name][:, None] * fz[np.arange(n)[:, None], rng.integers(0, window, (n, k))]
+            return mu_g[:, None] + S[name][:, None] * fz[np.arange(n)[:, None], rng.integers(0, gw, (n, k))]
         if name == "GARCH-t":
             nu = nu_t[:, None]
             return mu_t[:, None] + S[name][:, None] * np.sqrt((nu - 2) / nu) * rng.standard_t(nu, (n, k))
@@ -342,7 +359,7 @@ def backtest_var(r: pd.Series, alpha: float = 0.99, window: int = 250, refit: in
             return S[name][:, None] * zn
         return mu_w[:, None] + sd_w[:, None] * zn
 
-    real = pd.Series(x[window:], index=idx)
+    real = pd.Series(x[start:], index=idx)
     rv = real.to_numpy()
     rows = []
     scale = 250 / n if n else 0
@@ -771,6 +788,19 @@ def var_garch_t(r: pd.Series, alpha: float = 0.99, g: Garch | None = None) -> fl
 def es_garch_t(r: pd.Series, alpha: float = 0.99, g: Garch | None = None) -> float:
     g = g or garch_t_fit(r)
     return float(-g.mu + t_std_var_es(alpha, g.nu)[1] * g.sigma_next)
+
+
+def simulate_garch_t(g: Garch, h: int, n: int = 20_000, seed: int = 11) -> np.ndarray:
+    """simulate_fhs 와 같지만 z 를 잔차 복원추출 대신 분산 1 t_ν 에서 뽑는다 (h일 누적수익 n 개)."""
+    rng = np.random.default_rng(seed)
+    k = math.sqrt((g.nu - 2) / g.nu)
+    s2 = np.full(n, g.sigma_next ** 2)
+    tot = np.zeros(n)
+    for _ in range(h):
+        x = np.sqrt(s2) * rng.standard_t(g.nu, n) * k
+        tot += g.mu + x
+        s2 = g.omega + g.alpha * x * x + g.beta * s2
+    return tot
 
 
 # ── 실적 점프 ───────────────────────────────────────────────────────────
