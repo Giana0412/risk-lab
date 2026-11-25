@@ -44,6 +44,7 @@ METHOD_NAMES = {
     "코니시-피셔": T("코니시-피셔", "Cornish-Fisher"),
     "EWMA λ=0.94": "EWMA (λ=0.94)",
     "FHS-GARCH": "FHS-GARCH",
+    "GARCH-t": "GARCH-t",
     "몬테카를로 정규": T("몬테카를로 (정규)", "Monte Carlo (normal)"),
     "몬테카를로 t": T("몬테카를로 (t, ν=5)", "Monte Carlo (t, ν=5)"),
     "ES 역사적": T("ES · 역사적", "ES · historical"),
@@ -846,6 +847,43 @@ with tab_bt:
                "현재 북을 과거 전 기간 보유했다고 가정한 재현이다.",
                "Pass when both p-values are at least 0.05. Basel zones use exceptions per 250 days and apply to "
                "99% only. This replays the current book as if it had been held throughout."))
+
+        # ES 사후검증 — VaR 선을 넘은 날 '얼마나' 잃었는지가 예측 ES 와 맞았나
+        es_ok = (sm["Z2 p"] >= 0.05) & ~(sm["MF p"] < 0.05)   # 초과가 2회 미만이면 MF p 는 없다
+        es_passed = [METHOD_NAMES.get(m, m) for m in sm.index[es_ok]]
+        p(T(f"VaR 검정은 손실이 한도를 넘은 <b>횟수</b>만 본다. ES(기대손실)는 한도를 넘은 날의 <b>평균 손실</b>에 대한 "
+            "예측이므로, 넘은 날 실제로 잃은 금액과 따로 맞춰 본다. 아래 표의 '초과일 손실 ÷ ES'가 1보다 크면 "
+            "한도를 넘은 날 예측보다 더 크게 잃었다는 뜻이다. Z2(Acerbi–Székely)는 초과 횟수와 크기를 함께 보는 "
+            "점수로, 0 근처면 정상이고 음수일수록 손실을 작게 잡았다. p값은 각 방법이 옳다고 가정하고 같은 기간을 "
+            "2,000번 다시 뽑아 구했다. McNeil–Frey 검정은 초과일의 (손실 − ES)를 그날 변동성으로 나눈 값의 평균이 "
+            "0인지 본다. "
+            + (f"두 검정을 모두 통과한 방법은 <b>{', '.join(es_passed)}</b>이다." if es_passed else
+               "<b>두 검정을 모두 통과한 방법은 없다.</b>"),
+            "The VaR tests only count <b>how often</b> losses crossed the limit. ES (expected shortfall) forecasts the "
+            "<b>average loss</b> on those days, so it is checked separately against what was actually lost. In the "
+            "table below, 'Loss ÷ ES' above 1 means losses on exception days were larger than forecast. Z2 "
+            "(Acerbi–Székely) scores the number and size of exceptions together: near 0 is fine, negative means "
+            "losses were understated. Its p-value comes from redrawing the period 2,000 times assuming the method "
+            "is right. The McNeil–Frey test checks that (loss − ES) on exception days, scaled by that day's "
+            "volatility, averages zero. "
+            + (f"Methods passing both: <b>{', '.join(es_passed)}</b>." if es_passed else
+               "<b>No method passes both tests.</b>")))
+        c_ratio, c_esdec = T("초과일 손실 ÷ ES", "Loss ÷ ES"), T("판정", "Verdict")
+        es_view = pd.DataFrame({
+            c_ratio: sm["초과손실/ES"].values, "Z2": sm["Z2"].values, "Z2 p": sm["Z2 p"].values,
+            "McNeil–Frey p": sm["MF p"].values,
+            c_esdec: [T("적합", "Pass") if v else T("부적합", "Fail") for v in es_ok],
+        }, index=[METHOD_NAMES.get(m, m) for m in sm.index])
+        table_title(T(f"ES 사후검증 ({bt_target}, {bt_alpha:.0%})", f"ES backtest ({bt_target}, {bt_alpha:.0%})"))
+        table(es_view, fmt={c_ratio: num, "Z2": num, "Z2 p": lambda v: num(v, 3), "McNeil–Frey p": lambda v: num(v, 3)},
+              index_name=T("방법", "Method"), em_rows=tuple(es_passed))
+        note(T("두 검정 모두 손실을 작게 잡은 쪽만 보는 한쪽 검정이며, 두 p값이 모두 0.05 이상이면 적합. "
+               "EWMA는 따로 정한 ES가 없어 같은 변동성의 정규분포 ES를 썼다. 코니시-피셔는 보정한 분위수를 꼬리 "
+               "구간에서 평균했고, GARCH-t는 t분포(자유도 추정) 공식을 썼다. 초과가 2회 미만이면 McNeil–Frey는 계산하지 않는다.",
+               "Both tests are one-sided (they only flag understated losses); pass when both p-values are at least "
+               "0.05. EWMA has no ES of its own, so it uses the normal ES at the EWMA volatility. Cornish-Fisher "
+               "averages its adjusted quantile over the tail; GARCH-t uses the Student-t formula with estimated "
+               "degrees of freedom. McNeil–Frey is skipped with fewer than two exceptions."))
 
         m = st.selectbox(T("그림에 표시할 방법", "Method to plot"), list(bt.forecasts.columns),
                          index=list(bt.forecasts.columns).index(best), format_func=lambda k: METHOD_NAMES.get(k, k))
