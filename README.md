@@ -24,7 +24,7 @@ A Streamlit app that shows where a stock portfolio could be in a few weeks.
 | Outlook | Probability of beating the benchmark over the chosen period, and how bad the downside is | GARCH(1,1) on excess returns with earnings days removed → filtered historical simulation (20,000 paths) + each holding's historical earnings-day reactions added as jumps. Compared side by side with the model-free realized distribution |
 | Risk | Size of a one-day loss; which holdings drive risk | Historical VaR/ES, beta, tracking error, information ratio, Euler decomposition of normal VaR (component VaR) |
 | VaR | How much VaR depends on the method | Historical · variance-covariance · Cornish-Fisher · EWMA (RiskMetrics) · FHS-GARCH · Monte Carlo (normal / multivariate t) |
-| Backtest | Which method was actually right in the past | Rolling out-of-sample backtest; Kupiec POF, Christoffersen independence and conditional coverage; Basel traffic light |
+| Backtest | Which method was actually right in the past | Rolling out-of-sample backtest of VaR and ES (adds GARCH(1,1)-t); Kupiec POF, Christoffersen independence and conditional coverage; Basel traffic light; ES backtests: Acerbi–Székely Z2 and McNeil–Frey exceedance residuals |
 | Stress | What if a CPI surprise or a past crisis repeats | Replay of 5 CPI release days and 10 crisis windows (holdings not yet listed are proxied by beta); five-factor regression shocks |
 | Attribution | Why the mix beat or trailed the benchmark over the past 1–12 months | Buy-and-hold with drifting weights; per-holding contribution; Brinson-Fachler sector allocation vs selection (sector ETFs as benchmark sectors, benchmark weights rolled back from current fund data, reconstruction error shown); factor attribution with betas estimated before the period; Carino linking so every breakdown sums exactly to the active return; a random-portfolio test (20,000 same-weight portfolios with stocks swapped within their sector from the S&P 1500) to ask whether the result is skill or luck |
 | Intraday | Where the book stands versus the benchmark right now | 5-minute relative return against VaR lines, refreshed every 60 seconds |
@@ -53,8 +53,18 @@ A Streamlit app that shows where a stock portfolio could be in a few weeks.
   the current volatility regime).
 - **No partial bars.** When the app runs during the session, yfinance's unfinished daily bar for today is
   dropped from the sample.
+- **ES is backtested too.** VaR tests only count exceptions; the ES tests check how much was lost on those days.
+  Acerbi–Székely (2014) Z2 gets its p-value by redrawing the period 2,000 times (seeded) from each method's own
+  forecast distribution, not from the published critical values (which are for 97.5%, T=250 only). McNeil–Frey
+  (2000) tests that (loss − ES)/σ on exception days averages zero with a studentized bootstrap. Both are one-sided.
+  EWMA has no ES of its own and uses the normal ES at its volatility; Cornish-Fisher integrates its adjusted
+  quantile over the tail.
+- **GARCH-t.** GARCH(1,1) with unit-variance Student-t innovations; VaR and ES from the closed-form t quantile and
+  t ES. With a 250-day window the fitted volatility runs a few percent low and ν is noisy (finite-sample
+  effect), so it can still under-cover slightly; the 500-day window is closer to nominal.
 - **numpy and pandas only.** No scipy: GARCH uses variance targeting to reduce the MLE to two parameters and
-  evaluates a parameter grid in vectorized form.
+  evaluates a parameter grid in vectorized form. GARCH-t adds a ν grid on top of the same σ² paths and refines ν
+  by golden-section search; the t distribution comes from the regularized incomplete beta function.
 - **Bilingual.** Every visible string is written in Korean and English; switch at the top right or with
   `?lang=en` / `?lang=ko`.
 

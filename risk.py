@@ -1,7 +1,7 @@
 """실무 리스크 지표 — 순수 계산만. 데이터 수집·화면은 여기 없다.
 
 이 파일만 import 하면 브리핑(market_metrics.py)에서도 같은 숫자를 낼 수 있게
-pandas·numpy 밖의 의존성은 없다 (scipy 없이 정규분포·카이제곱은 math 로 푼다).
+pandas·numpy 밖의 의존성은 없다 (scipy 없이 정규분포·카이제곱·t 분포는 math 로 푼다).
 
 규약
 - 수익률은 **일간 단순수익률** (소수, 0.01 = 1%).
@@ -63,9 +63,27 @@ def var_cornish_fisher(r: pd.Series, alpha: float = 0.99) -> float:
     r = r.dropna()
     z = _N.inv_cdf(1 - alpha)
     s, k = float(r.skew()), float(r.kurt())  # pandas kurt 는 초과첨도
-    zcf = (z + (z**2 - 1) * s / 6 + (z**3 - 3 * z) * k / 24
-           - (2 * z**3 - 5 * z) * s**2 / 36)
-    return float(-(r.mean() + zcf * r.std()))
+    return float(-(r.mean() + _cf(z, s, k) * r.std()))
+
+
+def _cf(z, s, k):
+    """코니시-피셔 변환: 정규 분위수 z → 왜도 s·초과첨도 k 로 보정한 분위수."""
+    return (z + (z**2 - 1) * s / 6 + (z**3 - 3 * z) * k / 24
+            - (2 * z**3 - 5 * z) * s**2 / 36)
+
+
+def _tail_z(alpha: float, k: int = 400) -> np.ndarray:
+    """(0, 1−α) 를 k 등분한 중점의 정규 분위수 — 꼬리 평균을 수치적분할 때 쓴다."""
+    p = 1 - alpha
+    return np.array([_N.inv_cdf(p * (i + 0.5) / k) for i in range(k)])
+
+
+def es_cornish_fisher(r: pd.Series, alpha: float = 0.99) -> float:
+    """코니시-피셔 VaR 와 짝이 맞는 ES: ES = (1/(1−α))∫₀^{1−α} VaR_CF(u) du 를 중점법으로 적분.
+    왜도·첨도가 아주 크면 CF 변환이 단조가 아니게 되어 이 값도 믿기 어렵다(VaR 와 같은 한계)."""
+    r = r.dropna()
+    s, k = float(r.skew()), float(r.kurt())
+    return float(-(r.mean() + _cf(_tail_z(alpha), s, k).mean() * r.std()))
 
 
 def ewma_vol(r: pd.Series, lam: float = 0.94) -> pd.Series:
@@ -203,38 +221,133 @@ class Backtest:
     forecasts: pd.DataFrame   # 날짜 × 방법, 그날 아침의 1일 VaR 예측 (양수)
     realized: pd.Series       # 그날 실현 수익률
     summary: pd.DataFrame
+    es: pd.DataFrame | None = None     # 날짜 × 방법, 그날 아침의 1일 ES 예측 (양수)
+    sigma: pd.DataFrame | None = None  # 날짜 × 방법, 예측 분포의 σ (McNeil–Frey 표준화용)
 
 
-def backtest_var(r: pd.Series, alpha: float = 0.99, window: int = 250, refit: int = 20) -> Backtest:
-    """롤링 창으로 매일 '어제까지의 데이터'로 오늘 VaR 를 예측하고 위반을 센다.
-    바젤 신호등: 250일 99% 기준 위반 0–4 녹색 · 5–9 황색 · 10+ 적색."""
+# ── ES 백테스트 ─────────────────────────────────────────────────────────
+#
+# VaR 검정은 '선을 넘은 횟수'만 본다. 넘은 날 **얼마나** 잃었는지는 ES 가 책임진다.
+# 두 검정 모두 한쪽(ES 과소추정) 방향이다 — 리스크 관리에서 문제가 되는 쪽.
+#
+# Acerbi–Székely(2014) Z2 = Σ_t X_t·I_t / (T·(1−α)·ES_t) + 1.  X_t 는 수익률(손실 음수),
+#   I_t 는 VaR 초과. 예측이 맞으면 E[Z2] = 0, ES 를 과소추정하면(또는 초과가 너무 잦으면) 음수.
+#   p값은 **각 방법 자신의 예측분포에서** 실현값을 n_sim 번 다시 뽑아 Z2 귀무분포를 만들어 구한다
+#   (논문의 권장 방식. 공표 임계값 −0.70(5%)·−1.8(0.01%)은 97.5%·T=250 전용이라 쓰지 않는다).
+#   역사적 방법처럼 이산 분포면 귀무 하의 Z2 평균이 0 이 아닐 수 있는데, 시뮬레이션이 그걸 그대로 반영한다.
+# McNeil–Frey(2000) 초과 잔차: VaR 초과일의 (손실 − ES)/σ 는 평균 0 이어야 한다.
+#   중심화한 잔차를 복원추출하는 스튜던트화 부트스트랩(Efron–Tibshirani 1993 16.4)으로 H1: 평균 > 0.
+
+# 각 방법의 ES 가 무엇인지 — 자연스러운 ES 가 없는 방법은 여기 적힌 대로 대신한다.
+ES_BASIS = {
+    "역사적": "창 안 VaR 이하 손실의 평균",
+    "정규(분산-공분산)": "정규 ES (창 평균·표준편차)",
+    "코니시-피셔": "CF 분위수를 꼬리 구간에서 적분",
+    "EWMA λ=0.94": "정규 ES, σ = EWMA (평균 0)",
+    "FHS-GARCH": "VaR 이하 표준화 잔차 평균 × σ_GARCH",
+    "GARCH-t": "t_ν 닫힌 꼴 × σ_GARCH",
+}
+
+
+def es_z2(real, var, es, alpha: float) -> float:
+    """Acerbi–Székely Z2. real 수익률, var·es 는 양수 손실 예측."""
+    x, v, e = (np.asarray(a, float) for a in (real, var, es))
+    return float(np.where(x < -v, x / e, 0.0).sum() / (len(x) * (1 - alpha)) + 1)
+
+
+def _z2_many(draws: np.ndarray, v: np.ndarray, e: np.ndarray, alpha: float) -> np.ndarray:
+    """draws (날짜, 시뮬레이션) 각 열의 Z2."""
+    return np.where(draws < -v[:, None], draws / e[:, None], 0.0).sum(axis=0) / (len(v) * (1 - alpha)) + 1
+
+
+def mcneil_frey(real, var, es, sigma, n_boot: int = 2000, seed: int = 0) -> tuple[float, float, int]:
+    """McNeil–Frey 초과 잔차 검정. (잔차 평균, 한쪽 p값, 초과 수). 초과가 2회 미만이면 p = NaN."""
+    x, v, e, s = (np.asarray(a, float) for a in (real, var, es, sigma))
+    hit = x < -v
+    res = ((-x - e) / s)[hit]
+    k = len(res)
+    if k < 2:
+        return (float(res.mean()) if k else float("nan")), float("nan"), k
+    sd = res.std(ddof=1)
+    if sd == 0:
+        return float(res.mean()), float("nan"), k
+    t = res.mean() / (sd / math.sqrt(k))
+    c = res - res.mean()
+    b = c[np.random.default_rng(seed).integers(0, k, (n_boot, k))]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tb = b.mean(axis=1) / (b.std(axis=1, ddof=1) / math.sqrt(k))
+    return float(res.mean()), float((1 + (tb >= t).sum()) / (n_boot + 1)), k
+
+
+def backtest_var(r: pd.Series, alpha: float = 0.99, window: int = 250, refit: int = 20,
+                 n_sim: int = 2000, seed: int = 0) -> Backtest:
+    """롤링 창으로 매일 '어제까지의 데이터'로 오늘 VaR·ES 를 예측하고 위반을 센다.
+    바젤 신호등: 250일 99% 기준 위반 0–4 녹색 · 5–9 황색 · 10+ 적색.
+    n_sim: Z2 p값용 귀무 시뮬레이션 횟수 (0 이면 Z2 p 생략). seed 로 재현된다."""
     r = r.dropna()
     x = r.to_numpy()
+    n = len(r) - window
     idx = r.index[window:]
-    out = {name: [] for name in METHODS}
-    ew = ewma_vol(r)
+    names = list(METHODS) + ["FHS-GARCH", "GARCH-t"]
+    V, E, S = ({m: np.empty(n) for m in names} for _ in range(3))
+    ew = ewma_vol(r).to_numpy()            # ew[t] 는 t-1 까지로 만든 예측
     zq = -_N.inv_cdf(1 - alpha)
-    out["FHS-GARCH"] = []
-    g = None
-    for t in range(window, len(r)):
-        if g is None or (t - window) % refit == 0:
-            g = garch_fit(r.iloc[t - window:t])  # 모수만 20일마다 — σ 는 매일 갱신
-        xp = r.iloc[t - window:t].to_numpy() - g.mu
-        s2, nxt, _ = _filter(xp, g.omega, g.alpha, g.beta, float(xp.var()))
-        z = xp / np.sqrt(s2)
-        out["FHS-GARCH"].append(float(-(g.mu + np.quantile(z, 1 - alpha) * math.sqrt(nxt))))
+    zes = _N.pdf(zq) / (1 - alpha)         # 정규 ES 배수
+    tz = _tail_z(alpha)
+    # 귀무분포 시뮬레이션에 쓸 그날의 예측분포 모수
+    mu_w, sd_w, sk_w, ku_w, mu_g, mu_t, nu_t = (np.empty(n) for _ in range(7))
+    fz = np.empty((n, window))             # FHS 가 그날 쓴 표준화 잔차
+    g = gt = None
+    for i in range(n):
+        t = window + i
         past = r.iloc[t - window:t]
-        out["역사적"].append(var_historical(past, alpha))
-        out["정규(분산-공분산)"].append(var_parametric(past, alpha))
-        out["코니시-피셔"].append(var_cornish_fisher(past, alpha))
-        out["EWMA λ=0.94"].append(zq * ew.iloc[t])  # ew[t] 는 t-1 까지로 만든 예측
-    fc = pd.DataFrame(out, index=idx)
+        pv = past.to_numpy()
+        if g is None or i % refit == 0:     # 모수만 20일마다 — σ 는 매일 갱신
+            gr = _grid(past)
+            g, gt = garch_fit(past, gr), garch_t_fit(past, gr)
+            qt, et = t_std_var_es(alpha, gt.nu)
+        xp = pv - g.mu
+        s2, nxt, _ = _filter(xp, g.omega, g.alpha, g.beta, float(xp.var()))
+        z, sn = xp / np.sqrt(s2), math.sqrt(nxt)
+        qz = np.quantile(z, 1 - alpha)
+        V["FHS-GARCH"][i], E["FHS-GARCH"][i], S["FHS-GARCH"][i] = \
+            -(g.mu + qz * sn), -(g.mu + z[z <= qz].mean() * sn), sn
+        fz[i], mu_g[i] = z, g.mu
+        xt = pv - gt.mu
+        _, nxt, _ = _filter(xt, gt.omega, gt.alpha, gt.beta, float(xt.var()))
+        st_ = math.sqrt(nxt)
+        V["GARCH-t"][i], E["GARCH-t"][i], S["GARCH-t"][i] = -gt.mu + qt * st_, -gt.mu + et * st_, st_
+        mu_t[i], nu_t[i] = gt.mu, gt.nu
+        m, sd, sk, ku = pv.mean(), pv.std(ddof=1), float(past.skew()), float(past.kurt())
+        mu_w[i], sd_w[i], sk_w[i], ku_w[i] = m, sd, sk, ku
+        V["역사적"][i], E["역사적"][i], S["역사적"][i] = var_historical(past, alpha), es_historical(past, alpha), sd
+        V["정규(분산-공분산)"][i], E["정규(분산-공분산)"][i], S["정규(분산-공분산)"][i] = -(m - zq * sd), -(m - zes * sd), sd
+        V["코니시-피셔"][i], E["코니시-피셔"][i], S["코니시-피셔"][i] = \
+            -(m + _cf(-zq, sk, ku) * sd), -(m + _cf(tz, sk, ku).mean() * sd), sd
+        V["EWMA λ=0.94"][i], E["EWMA λ=0.94"][i], S["EWMA λ=0.94"][i] = zq * ew[t], zes * ew[t], ew[t]
+
+    def null_draws(name: str, rng: np.random.Generator, k: int) -> np.ndarray:
+        """그 방법이 맞다고 할 때의 실현 수익률 k 세트 (날짜 × k)."""
+        if name == "역사적":
+            return x[np.arange(n)[:, None] + rng.integers(0, window, (n, k))]
+        if name == "FHS-GARCH":
+            return mu_g[:, None] + S[name][:, None] * fz[np.arange(n)[:, None], rng.integers(0, window, (n, k))]
+        if name == "GARCH-t":
+            nu = nu_t[:, None]
+            return mu_t[:, None] + S[name][:, None] * np.sqrt((nu - 2) / nu) * rng.standard_t(nu, (n, k))
+        zn = rng.standard_normal((n, k))
+        if name == "코니시-피셔":
+            return mu_w[:, None] + sd_w[:, None] * _cf(zn, sk_w[:, None], ku_w[:, None])
+        if name == "EWMA λ=0.94":
+            return S[name][:, None] * zn
+        return mu_w[:, None] + sd_w[:, None] * zn
+
     real = pd.Series(x[window:], index=idx)
-    n = len(idx)
+    rv = real.to_numpy()
     rows = []
     scale = 250 / n if n else 0
-    for m in fc:
-        hits = (real < -fc[m]).to_numpy()
+    for j, m in enumerate(names):
+        hits = rv < -V[m]
         k = int(hits.sum())
         lr_pof, p_pof = kupiec_pof(k, n, alpha)
         lr_ind, p_ind = christoffersen_ind(hits)
@@ -245,10 +358,23 @@ def backtest_var(r: pd.Series, alpha: float = 0.99, window: int = 250, refit: in
             light = "— (99% 전용)"
         else:
             light = "🟢 녹색" if k250 < 5 else ("🟡 황색" if k250 < 10 else "🔴 적색")
+        z2 = es_z2(rv, V[m], E[m], alpha)
+        p_z2 = float("nan")
+        if n_sim:
+            rng = np.random.default_rng(seed + j)
+            sims = np.concatenate([_z2_many(null_draws(m, rng, b), V[m], E[m], alpha)
+                                   for b in [250] * (n_sim // 250) + ([n_sim % 250] if n_sim % 250 else [])])
+            p_z2 = float((1 + (sims <= z2).sum()) / (len(sims) + 1))
+        mf, p_mf, _ = mcneil_frey(rv, V[m], E[m], S[m], seed=seed + j)
+        ratio = float(-rv[hits].mean() / E[m][hits].mean()) if k else float("nan")
         rows.append({"방법": m, "위반": k, "기대": round(n * (1 - alpha), 1), "표본일": n,
                      "Kupiec p": p_pof, "독립성 p": p_ind, "조건부커버리지 p": p_cc,
-                     "바젤(250일 환산)": light})
-    return Backtest(fc, real, pd.DataFrame(rows).set_index("방법"))
+                     "바젤(250일 환산)": light,
+                     "초과손실/ES": ratio, "Z2": z2, "Z2 p": p_z2, "MF 잔차": mf, "MF p": p_mf,
+                     "ES 산식": ES_BASIS[m]})
+    fc = pd.DataFrame(V, index=idx)
+    return Backtest(fc, real, pd.DataFrame(rows).set_index("방법"),
+                    pd.DataFrame(E, index=idx), pd.DataFrame(S, index=idx))
 
 
 # ── 스트레스 테스트 ─────────────────────────────────────────────────────
@@ -417,6 +543,7 @@ class Garch:
     sigma: pd.Series     # σ_t — t 일 시작 시점 예측 (t−1 까지만 사용)
     z: pd.Series         # 표준화 잔차 (r_t − μ)/σ_t
     sigma_next: float    # 마지막 날 다음 거래일의 σ
+    nu: float | None = None  # GARCH-t 의 자유도 (정규 준우도 적합이면 None)
 
     @property
     def persistence(self) -> float:
@@ -436,6 +563,13 @@ _GA, _GB = _AA[_OK], _BB[_OK]
 
 def _filter(x: np.ndarray, omega, a, b, s0):
     """σ² 재귀. omega·a·b 가 배열이면 격자 전체를 한 번에 돈다."""
+    if np.ndim(omega) == 0:  # 모수 한 벌 — 백테스트가 매일 부르므로 0차원 배열 대신 float 로 돈다
+        s2, om, a, b, ll, out = float(s0), float(omega), float(a), float(b), 0.0, []
+        for xt in np.asarray(x, float).tolist():
+            out.append(s2)
+            ll += -0.5 * (math.log(s2) + xt * xt / s2)
+            s2 = om + a * xt * xt + b * s2
+        return np.array(out), s2, ll
     s2 = np.broadcast_to(np.asarray(s0, float), np.shape(omega)).copy()
     out = np.empty((len(x),) + np.shape(omega))
     ll = np.zeros(np.shape(omega))
@@ -446,13 +580,18 @@ def _filter(x: np.ndarray, omega, a, b, s0):
     return out, s2, ll
 
 
-def garch_fit(r: pd.Series) -> Garch:
+def _grid(r: pd.Series):
+    """(α, β) 격자 전체의 σ² 경로와 정규 로그우도. garch_fit·garch_t_fit 이 함께 쓴다."""
     r = r.dropna()
     mu = float(r.mean())
     x = r.to_numpy() - mu
     v = float(x.var())
-    om = v * (1 - _GA - _GB)
-    _, _, ll = _filter(x, om, _GA, _GB, v)
+    s2g, _, ll = _filter(x, v * (1 - _GA - _GB), _GA, _GB, v)
+    return r, mu, x, v, s2g, ll
+
+
+def garch_fit(r: pd.Series, grid=None) -> Garch:
+    r, mu, x, v, _, ll = grid or _grid(r)
     i = int(np.argmax(ll))
     a, b = float(_GA[i]), float(_GB[i])
     s2, nxt, _ = _filter(x, v * (1 - a - b), a, b, v)
@@ -484,6 +623,154 @@ def simulate_fhs(g: Garch, h: int, n: int = 20_000, seed: int = 11) -> np.ndarra
         tot += g.mu + x
         s2 = g.omega + g.alpha * x * x + g.beta * s2
     return tot
+
+
+# ── GARCH-t: 스튜던트 t 혁신 ────────────────────────────────────────────
+#
+# FHS 는 꼬리 모양을 창 안의 잔차 250개에서 빌린다 — 99% 꼬리엔 점이 두세 개뿐이다.
+# GARCH-t 는 꼬리 모양을 모수 하나(자유도 ν)로 요약한다: z_t ~ 분산 1 로 맞춘 t_ν.
+# ν → ∞ 면 정규, ν = 4~6 이 주식 일간 수익률의 전형적 값이다.
+#
+# 추정은 같은 격자 방식을 넓힌다: 분산 타기팅 ω = σ̄²(1−α−β) 는 그대로 두고, (α, β) 격자 ×
+# ν 격자에서 t 로그우도를 한 번에 평가한 뒤, 최적 (α, β) 에서 ν 만 황금분할로 연속 정밀화한다.
+# σ² 경로는 ν 와 무관하므로 격자 전체에 대해 한 번만 돌린다 — 롤링 재추정에도 충분히 빠르다.
+# scipy 없이 t 분포 CDF 는 정규화 불완전 베타 함수(연분수, Numerical Recipes 6.4)로 푼다.
+
+_NU_GRID = np.array([2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0, 15.0, 20.0, 30.0, 50.0, 100.0])
+NU_MAX = 200.0
+
+
+def _betacf(a: float, b: float, x: float) -> float:
+    """불완전 베타의 연분수 (modified Lentz)."""
+    tiny = 1e-300
+    c, d = 1.0, 1.0 - (a + b) * x / (a + 1)
+    d = 1 / (d if abs(d) > tiny else tiny)
+    h = d
+    for m in range(1, 500):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((a + m2 - 1) * (a + m2))
+        d = 1 + aa * d; d = 1 / (d if abs(d) > tiny else tiny)
+        c = 1 + aa / c; c = c if abs(c) > tiny else tiny
+        h *= d * c
+        aa = -(a + m) * (a + b + m) * x / ((a + m2) * (a + m2 + 1))
+        d = 1 + aa * d; d = 1 / (d if abs(d) > tiny else tiny)
+        c = 1 + aa / c; c = c if abs(c) > tiny else tiny
+        dl = d * c
+        h *= dl
+        if abs(dl - 1) < 1e-14:
+            break
+    return h
+
+
+def _betainc(a: float, b: float, x: float) -> float:
+    """정규화 불완전 베타 I_x(a, b)."""
+    if x <= 0:
+        return 0.0
+    if x >= 1:
+        return 1.0
+    lb = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log1p(-x)
+    if x < (a + 1) / (a + b + 2):
+        return math.exp(lb) * _betacf(a, b, x) / a
+    return 1 - math.exp(lb) * _betacf(b, a, 1 - x) / b
+
+
+def t_cdf(x: float, nu: float) -> float:
+    """표준(분산 ν/(ν−2)) 스튜던트 t 의 CDF."""
+    tail = 0.5 * _betainc(nu / 2, 0.5, nu / (nu + x * x))
+    return tail if x < 0 else 1 - tail
+
+
+def t_pdf(x: float, nu: float) -> float:
+    return math.exp(math.lgamma((nu + 1) / 2) - math.lgamma(nu / 2) - 0.5 * math.log(nu * math.pi)
+                    - (nu + 1) / 2 * math.log1p(x * x / nu))
+
+
+def t_ppf(p: float, nu: float) -> float:
+    """t_ν 분위수. 이분법 — 단조라 안전하고, ν 는 재추정 때만 바뀌어 호출이 드물다."""
+    if p == 0.5:
+        return 0.0
+    if p > 0.5:
+        return -t_ppf(1 - p, nu)
+    lo, hi = -1.0, 0.0
+    while t_cdf(lo, nu) > p:   # 왼쪽 끝을 넓혀 가며 감싼다
+        lo *= 2
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if t_cdf(mid, nu) > p:
+            hi = mid
+        else:
+            lo = mid
+        if hi - lo < 1e-12:
+            break
+    return 0.5 * (lo + hi)
+
+
+def t_std_var_es(alpha: float, nu: float) -> tuple[float, float]:
+    """분산 1 로 맞춘 t_ν 의 왼쪽 꼬리 (VaR, ES) — 손실 양수. 닫힌 꼴:
+    q = |t_ν⁻¹(1−α)|,  ES_t = g_ν(q)/(1−α)·(ν + q²)/(ν − 1),  둘 다 √((ν−2)/ν) 를 곱한다."""
+    p = 1 - alpha
+    q = -t_ppf(p, nu)
+    es = t_pdf(q, nu) / p * (nu + q * q) / (nu - 1)
+    k = math.sqrt((nu - 2) / nu)
+    return q * k, es * k
+
+
+def _t_ll(u: np.ndarray, logs2_sum: np.ndarray, n: int, nu: float) -> np.ndarray:
+    """표준화 t 로그우도 (상수 포함). u = x²/σ² (시간 × 격자), logs2_sum = Σ log σ²."""
+    c = math.lgamma((nu + 1) / 2) - math.lgamma(nu / 2) - 0.5 * math.log(math.pi * (nu - 2))
+    return n * c - 0.5 * logs2_sum - (nu + 1) / 2 * np.log1p(u / (nu - 2)).sum(axis=0)
+
+
+def garch_t_fit(r: pd.Series, grid=None) -> Garch:
+    """GARCH(1,1)-t. 반환 Garch 의 nu 가 채워진다. z 는 분산 1 기준 표준화 잔차.
+    grid: _grid(r) 결과를 넘기면 σ² 격자 경로(ν 와 무관)를 다시 돌리지 않는다."""
+    r, mu, x, v, s2g, _ = grid or _grid(r)
+    n = len(x)
+    u = (x * x)[:, None] / s2g
+    ls = np.log(s2g).sum(axis=0)
+    # (α, β) 우도면은 ν 에 따라 거의 움직이지 않는다: ν 3개로 전체 격자를 훑어 후보 (α, β) 를
+    # 추린 뒤, 후보에서만 ν 격자 전체를 본다 (전체 격자 × ν 16개의 약 1/5 비용).
+    cand = np.unique(np.concatenate([np.argsort(_t_ll(u, ls, n, nu))[-40:] for nu in (4.0, 8.0, 30.0)]))
+    uc, lc = u[:, cand], ls[cand]
+    best = (-np.inf, 0, 0.0)
+    for nu in _NU_GRID:
+        ll = _t_ll(uc, lc, n, nu)
+        j = int(np.argmax(ll))
+        if ll[j] > best[0]:
+            best = (float(ll[j]), int(cand[j]), float(nu))
+    i = best[1]
+    ui, li = u[:, i:i + 1], ls[i:i + 1]
+    # ν 정밀화: log(ν−2) 위에서 황금분할 (격자 이웃 사이)
+    f = lambda y: -float(_t_ll(ui, li, n, 2 + math.exp(y))[0])
+    k = int(np.searchsorted(_NU_GRID, best[2]))
+    lo = math.log((_NU_GRID[k - 1] if k > 0 else 2.05) - 2)
+    hi = math.log((_NU_GRID[k + 1] if k + 1 < len(_NU_GRID) else NU_MAX) - 2)
+    gr = (math.sqrt(5) - 1) / 2
+    c1, c2 = hi - gr * (hi - lo), lo + gr * (hi - lo)
+    f1, f2 = f(c1), f(c2)
+    for _ in range(40):
+        if f1 < f2:
+            hi, c2, f2 = c2, c1, f1
+            c1 = hi - gr * (hi - lo); f1 = f(c1)
+        else:
+            lo, c1, f1 = c1, c2, f2
+            c2 = lo + gr * (hi - lo); f2 = f(c2)
+    nu = 2 + math.exp(0.5 * (lo + hi))
+    a, b = float(_GA[i]), float(_GB[i])
+    s2, nxt, _ = _filter(x, v * (1 - a - b), a, b, v)
+    sig = np.sqrt(s2)
+    return Garch(v * (1 - a - b), a, b, mu, pd.Series(sig, r.index),
+                 pd.Series(x / sig, r.index), float(math.sqrt(nxt)), nu)
+
+
+def var_garch_t(r: pd.Series, alpha: float = 0.99, g: Garch | None = None) -> float:
+    g = g or garch_t_fit(r)
+    return float(-g.mu + t_std_var_es(alpha, g.nu)[0] * g.sigma_next)
+
+
+def es_garch_t(r: pd.Series, alpha: float = 0.99, g: Garch | None = None) -> float:
+    g = g or garch_t_fit(r)
+    return float(-g.mu + t_std_var_es(alpha, g.nu)[1] * g.sigma_next)
 
 
 # ── 실적 점프 ───────────────────────────────────────────────────────────

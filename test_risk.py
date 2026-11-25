@@ -57,6 +57,8 @@ def test_independence_detects_clustering():
 def test_backtest_normal_is_calibrated():
     bt = risk.backtest_var(_normal(1500, seed=3), 0.99, 250)
     assert bt.summary.loc["정규(분산-공분산)", "Kupiec p"] > 0.05
+    assert bt.summary.loc["정규(분산-공분산)", "Z2 p"] > 0.05      # i.i.d. 정규 → ES 도 맞다
+    assert abs(bt.summary.loc["정규(분산-공분산)", "Z2"]) < 0.5
 
 
 def test_monte_carlo_t_is_wider_than_normal():
@@ -295,3 +297,75 @@ def test_random_portfolio_test():
     # A 는 후보 중 최고, B 는 위쪽 → 실제 이상인 경우는 (A=0.20, B=0.05) 뿐: 1/4 × 1/2
     assert abs(rt.p_value - 0.125) < 0.01
     assert rt.kept == ["ETF"] and rt.replaced == ["A", "B"]
+
+
+# ── GARCH-t · ES 백테스트 ───────────────────────────────────────────────
+
+def _garch_t_sim(n=3000, w=2e-6, a=0.08, b=0.90, nu=5.0, seed=6):
+    """분산 1 로 맞춘 t_ν 혁신의 GARCH(1,1)."""
+    rng = np.random.default_rng(seed)
+    k = math.sqrt((nu - 2) / nu)
+    s2, x = w / (1 - a - b), np.empty(n)
+    for t in range(n):
+        x[t] = math.sqrt(s2) * rng.standard_t(nu) * k
+        s2 = w + a * x[t] ** 2 + b * s2
+    return pd.Series(x)
+
+
+def test_t_quantile_and_es_closed_forms():
+    # 표의 값: t_5 99% 3.3649, t_3 97.5% 3.1824, t_10 95% 1.8125
+    assert abs(risk.t_ppf(0.99, 5) - 3.36493) < 1e-4
+    assert abs(risk.t_ppf(0.025, 3) + 3.18245) < 1e-4
+    assert abs(risk.t_ppf(0.95, 10) - 1.81246) < 1e-4
+    # ν → ∞ 면 정규: VaR 2.3263, ES 2.6652
+    q, es = risk.t_std_var_es(0.99, 1e6)
+    assert abs(q - 2.3263) < 1e-3 and abs(es - 2.6652) < 1e-3
+    # 분산 1 t_4 의 ES 를 몬테카를로와 대조
+    z = np.random.default_rng(0).standard_t(4, 2_000_000) * math.sqrt(2 / 4)
+    qs = np.quantile(z, 0.01)
+    q, es = risk.t_std_var_es(0.99, 4)
+    assert abs(q + qs) / q < 0.01 and abs(es + z[z <= qs].mean()) / es < 0.015
+
+
+def test_garch_t_recovers_nu_and_params():
+    g = risk.garch_t_fit(_garch_t_sim(nu=5.0))
+    assert abs(g.nu - 5) < 1.5
+    assert abs(g.alpha - 0.08) < 0.04 and abs(g.beta - 0.90) < 0.05
+    # 정규 혁신이면 ν 가 크게 나와야 한다 (t 가 정규로 수렴)
+    assert risk.garch_t_fit(_garch_sim(seed=7)).nu > 15
+    r = _garch_t_sim(nu=5.0)
+    assert risk.es_garch_t(r, 0.99) > risk.var_garch_t(r, 0.99) > 0
+
+
+def test_cornish_fisher_es_matches_normal_when_no_skew():
+    r = _normal(50_000, seed=12)
+    assert abs(risk.es_cornish_fisher(r, 0.99) - risk.es_parametric(r, 0.99)) < 5e-4
+
+
+def test_z2_zero_when_correct_and_negative_when_es_too_small():
+    alpha, n = 0.99, 200_000
+    z, e = -risk._N.inv_cdf(1 - alpha), risk._N.pdf(risk._N.inv_cdf(1 - alpha)) / (1 - alpha)
+    v, es = np.full(n, z), np.full(n, e)
+    x = np.random.default_rng(13).standard_normal(n)
+    assert abs(risk.es_z2(x, v, es, alpha)) < 0.07          # 정규 데이터 + 정규 예측 (표준오차 ≈ 0.023)
+    t3 = np.random.default_rng(14).standard_t(3, n) / math.sqrt(3)   # 분산 1 t_3
+    assert risk.es_z2(t3, v, es, alpha) < -0.5                # 팻테일 데이터 + 정규 예측
+    # McNeil–Frey: 맞는 모형은 기각되지 않고, 정규 ES 는 t 꼬리에서 기각된다
+    assert risk.mcneil_frey(x, v, es, np.ones(n))[1] > 0.05
+    m, p, k = risk.mcneil_frey(t3, v, es, np.ones(n))
+    assert m > 0 and p < 0.01 and k > 1000
+
+
+def test_es_backtest_garch_t_passes_normal_es_fails():
+    """t-GARCH 데이터: GARCH-t 는 커버리지·ES 검정을 통과, 정규 ES(EWMA σ)는 ES 를 과소추정."""
+    bt = risk.backtest_var(_garch_t_sim(2000, nu=4.0, seed=10), 0.975, 500, n_sim=1000)
+    s = bt.summary
+    assert list(bt.es.columns) == list(bt.forecasts.columns) and "GARCH-t" in bt.es
+    assert (bt.es >= bt.forecasts - 1e-12).all().all()         # ES ≥ VaR
+    g, e = s.loc["GARCH-t"], s.loc["EWMA λ=0.94"]
+    assert g["Kupiec p"] > 0.05 and g["Z2 p"] > 0.05 and g["MF p"] > 0.05
+    assert e["MF 잔차"] > 0 and e["MF p"] < 0.01 and e["Z2 p"] < 0.05
+    assert e["Z2"] < g["Z2"]
+    # EWMA 의 ES 는 같은 σ 의 정규 ES 그대로다
+    k = risk._N.pdf(risk._N.inv_cdf(0.025)) / 0.025 / -risk._N.inv_cdf(0.025)
+    assert np.allclose(bt.es["EWMA λ=0.94"], k * bt.forecasts["EWMA λ=0.94"])
