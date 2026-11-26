@@ -246,6 +246,8 @@ ES_BASIS = {
     "EWMA λ=0.94": "정규 ES, σ = EWMA (평균 0)",
     "FHS-GARCH": "VaR 이하 표준화 잔차 평균 × σ_GARCH",
     "GARCH-t": "t_ν 닫힌 꼴 × σ_GARCH",
+    "HAR": "VaR 이하 표준화 잔차 평균 × σ_HAR",
+    "HAR-X": "VaR 이하 표준화 잔차 평균 × σ_HAR-X",
 }
 
 
@@ -283,7 +285,8 @@ GARCH_WINDOW = 500   # GARCH 계열 모수 추정 창 (backtest_var 설명 참�
 
 
 def backtest_var(r: pd.Series, alpha: float = 0.99, window: int = 250, refit: int = 20,
-                 n_sim: int = 2000, seed: int = 0, garch_window: int | None = GARCH_WINDOW) -> Backtest:
+                 n_sim: int = 2000, seed: int = 0, garch_window: int | None = GARCH_WINDOW,
+                 earn: pd.Series | None = None) -> Backtest:
     """롤링 창으로 매일 '어제까지의 데이터'로 오늘 VaR·ES 를 예측하고 위반을 센다.
     바젤 신호등: 250일 99% 기준 위반 0–4 녹색 · 5–9 황색 · 10+ 적색.
     n_sim: Z2 p값용 귀무 시뮬레이션 횟수 (0 이면 Z2 p 생략). seed 로 재현된다.
@@ -296,14 +299,17 @@ def backtest_var(r: pd.Series, alpha: float = 0.99, window: int = 250, refit: in
       FHS-GARCH 40%→20% (FHS 만 250일로 두면 50%). 97.5% 는 FHS 20%→0%.
     검정 기간은 모든 방법이 같다: 예측은 max(window, garch_window) 번째 날부터 시작하고, 그 앞의
       날은 어느 방법도 채점하지 않는다. 그래서 방법 간 비교는 같은 날짜끼리의 짝 비교로 남는다
-      (대신 garch_window 가 길면 같은 데이터에서 검정일 수가 그만큼 줄어든다)."""
+      (대신 garch_window 가 길면 같은 데이터에서 검정일 수가 그만큼 줄어든다).
+    HAR·HAR-X 도 garch_window 창으로 적합한다(계수 7–8개, 66일 지연 피처). 계수는 GARCH 와 같이 refit 일마다,
+      σ̂·배율 c·표준화 잔차는 매일 갱신한다. earn: earnings_exposure(h=1) 를 r 날짜에 맞춘 것 — 값 s 는
+      s+1 일 예측에 쓰인다. 없으면 HAR-X 는 실적 항 없이(레버리지·lv66 만) 돈다."""
     r = r.dropna()
     x = r.to_numpy()
     gw = int(garch_window or window)
     start = max(window, gw)
     n = len(r) - start
     idx = r.index[start:]
-    names = list(METHODS) + ["FHS-GARCH", "GARCH-t"]
+    names = list(METHODS) + ["FHS-GARCH", "GARCH-t", "HAR", "HAR-X"]
     V, E, S = ({m: np.empty(n) for m in names} for _ in range(3))
     ew = ewma_vol(r).to_numpy()            # ew[t] 는 t-1 까지로 만든 예측
     zq = -_N.inv_cdf(1 - alpha)
@@ -313,6 +319,12 @@ def backtest_var(r: pd.Series, alpha: float = 0.99, window: int = 250, refit: in
     mu_w, sd_w, sk_w, ku_w, mu_g, mu_t, nu_t = (np.empty(n) for _ in range(7))
     fz = np.empty((n, gw))                 # FHS 가 그날 쓴 표준화 잔차
     g = gt = None
+    # HAR 계열: 피처는 한 번에 만든다 (행 s 는 s 까지의 자료만 쓴다). 적합 행은 _har_rows 가 고른다.
+    F, hy, hf2, hfs = _har_design(r, earn, 1)
+    HA = {m: np.column_stack([np.ones(len(r)), F[c].to_numpy()]) for m, c in (("HAR", HAR_COLS), ("HAR-X", HARX_COLS))}
+    hb = dict.fromkeys(HA)
+    hz = {m: np.full((n, gw), np.nan) for m in HA}   # 그날의 표준화 잔차 (오른쪽 정렬)
+    hk = {m: np.zeros(n, int) for m in HA}
     for i in range(n):
         t = start + i
         past = r.iloc[t - window:t]
@@ -335,6 +347,13 @@ def backtest_var(r: pd.Series, alpha: float = 0.99, window: int = 250, refit: in
         st_ = math.sqrt(nxt)
         V["GARCH-t"][i], E["GARCH-t"][i], S["GARCH-t"][i] = -gt.mu + qt * st_, -gt.mu + et * st_, st_
         mu_t[i], nu_t[i] = gt.mu, gt.nu
+        rows = _har_rows(t, gw)
+        for m, A in HA.items():
+            # 계수는 refit 일마다(첫날 포함) 다시 적합, 그 사이엔 고정
+            hb[m], _, sn, z = _har_step(A, hy, hf2, hfs, rows, t - 1, 1, None if i % refit == 0 else hb[m])
+            q = np.quantile(z, 1 - alpha)
+            V[m][i], E[m][i], S[m][i] = -q * sn, -z[z <= q].mean() * sn, sn
+            hz[m][i, gw - len(z):], hk[m][i] = z, len(z)
         m, sd, sk, ku = pv.mean(), pv.std(ddof=1), float(past.skew()), float(past.kurt())
         mu_w[i], sd_w[i], sk_w[i], ku_w[i] = m, sd, sk, ku
         V["역사적"][i], E["역사적"][i], S["역사적"][i] = var_historical(past, alpha), es_historical(past, alpha), sd
@@ -349,6 +368,10 @@ def backtest_var(r: pd.Series, alpha: float = 0.99, window: int = 250, refit: in
             return x[(start - window + np.arange(n))[:, None] + rng.integers(0, window, (n, k))]
         if name == "FHS-GARCH":
             return mu_g[:, None] + S[name][:, None] * fz[np.arange(n)[:, None], rng.integers(0, gw, (n, k))]
+        if name in HA:
+            k_ = hk[name][:, None]
+            j_ = gw - k_ + (rng.random((n, k)) * k_).astype(int)
+            return S[name][:, None] * hz[name][np.arange(n)[:, None], j_]
         if name == "GARCH-t":
             nu = nu_t[:, None]
             return mu_t[:, None] + S[name][:, None] * np.sqrt((nu - 2) / nu) * rng.standard_t(nu, (n, k))
@@ -801,6 +824,182 @@ def simulate_garch_t(g: Garch, h: int, n: int = 20_000, seed: int = 11) -> np.nd
         tot += g.mu + x
         s2 = g.omega + g.alpha * x * x + g.beta * s2
     return tot
+
+
+# ── HAR / HAR-X: 실현분산 회귀로 내일 σ 를 예측한다 ─────────────────────
+#
+# HAR(Corsi 2009): 내일 분산의 로그를 어제·지난 5일·지난 22일 평균 분산의 로그에 OLS 로 회귀한다.
+#   장중 자료가 없어 그날의 '실현분산'은 r²(일간 수익률 제곱) 하나다 — 아주 시끄러운 대용치(log χ²₁)라
+#   로그에 바닥이 필요하다: floor_s = HAR_FLOOR × (s 까지 66일 평균 r²). |r| 이 최근 σ 의 10% 보다 작은
+#   날은 그 값으로 올린다. 바닥도 s 까지의 자료로만 정해진다.
+#   예측 σ̂² = c·exp(ŷ). 로그 회귀의 예측은 기하평균이라 분산을 낮게 잡는다(젠센) — c = 적합 창의
+#   mean(r²/exp ŷ) 로 맞춘다(quant_auto KAN-24 vol.py 와 같은 배율, QLIKE 를 최소로 하는 값).
+#   VaR·ES = σ̂ × (적합 창 표준화 잔차 z = r/σ̂ 의 분위수·꼬리평균) — FHS 와 같은 방식, 평균 0.
+#   (FHS 에서는 c 가 σ̂ 와 z 양쪽에서 상쇄된다. 정규·t 변형에서만 c 가 값을 바꾼다.)
+#
+# HAR-X = HAR + lv66 + 레버리지(어제 하락폭 neg = min(r,0)/σ₂₂, 5일 하방 준분산 lsd5) + 실적 노출 earn.
+#   KAN-24(S&P 500 585종목 일간 패널, 2017–2026)에서 선형 HAR-X 는 HAR 보다 QLIKE 가 5.7%(h=1)·18.2%(h=5)
+#   낮았고, 이득의 61–72% 가 실적 발표가 낀 창에서 나왔다(LightGBM 은 선형 위에 더한 것이 없다).
+#   그러나 1일 99% VaR(필터드 HS) 위반율은 EWMA 1.09%, HAR-X 1.10%, HAR 1.31% — 예측 손실이 낫다고
+#   VaR 커버리지가 그만큼 나아지지는 않았다. 여기서는 종목이 아니라 북(또는 벤치 대비) 수익률 하나에 적합한다.
+#
+# 🔴 실적 노출 earn_s = Σ w_i · 1{종목 i 의 '투영' 다음 반응일이 s 기준 [−3, h+2] 세션 안}.
+#   투영은 s 까지 **이미 반응한** 발표만 쓴다 (vol.py 와 같은 규칙):
+#     다음 = (4분기 전 반응일) + 364일. 기록이 4건 미만이거나 그 값이 마지막 반응일 + 30일 이하면 마지막 + 91일.
+#   발표 시각 → 반응일은 reaction_candidates 로 정한다(개장 전이면 그날, 장중·마감 후면 다음 거래일,
+#   00:00 이면 늦은 후보). 가격은 보지 않는다. 회사가 공지한 예정일은 쓰지 않는다 — 공지 시점 기록이 없어
+#   과거 어느 날에 그 예정일을 알았는지 재현할 수 없다. 창 앞쪽 −3 은 투영일이 지났는데 아직 발표가 없는
+#   경우(임박)를 잡는다. KAN-24 에서 투영 오차는 중앙값 1일, ±7일 안 94%.
+#   한계: 종목별 첫 발표 기록 이전 구간은 노출 0 으로 들어간다(과소). Yahoo 기록은 6년 남짓이다.
+
+HAR_FLOOR = 0.01
+HAR_MIN_ROW = 65                      # lv66·바닥이 처음 정의되는 행 (66일째)
+HAR_COLS = ["lv1", "lv5", "lv22"]
+HARX_COLS = HAR_COLS + ["lv66", "neg", "lsd5", "earn"]
+EARN_WINDOW = (-3, 2)                 # 노출 창: 투영 반응일 − s ∈ [−3, h + 2] 세션
+
+
+def reaction_dates(stamps, trading_days: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """발표 시각들 → 반응 거래일 (정렬, 중복 제거). 시각이 00:00 이면 늦은 후보 — 가격을 보지 않는다."""
+    out = []
+    for ts in stamps:
+        c = reaction_candidates(pd.Timestamp(ts), trading_days)
+        if c:
+            out.append(max(c))
+    return pd.DatetimeIndex(sorted(set(out)))
+
+
+def project_next(rx: pd.DatetimeIndex) -> pd.Timestamp | None:
+    """이미 반응한 발표들(오름차순) → 다음 반응일 투영. 기록이 없으면 None."""
+    if not len(rx):
+        return None
+    last = rx[-1]
+    if len(rx) >= 4:
+        ya = rx[-4] + pd.Timedelta(days=364)
+        if ya > last + pd.Timedelta(days=30):
+            return ya
+    return last + pd.Timedelta(days=91)
+
+
+def earnings_exposure(stamps: dict[str, list], weights: dict[str, float], sessions: pd.DatetimeIndex,
+                      h: int = 1, calendar: pd.DatetimeIndex | None = None) -> pd.Series:
+    """날짜 s 마다 '다음 h 거래일 앞뒤로 실적이 투영된 보유 종목의 비중 합' (위 🔴 규칙).
+    stamps: 티커 → 발표 시각 목록 (data.earnings_dates_one). sessions: 값을 낼 거래일.
+    calendar: 발표 → 반응일 변환과 세션 차에 쓸 거래일 달력(sessions 보다 길게, 예: 가격 표 전체 날짜).
+      달력 시작 전의 발표는 버린다 — 첫 거래일로 잘못 붙지 않게.
+    s 의 값은 s 종가까지 반응한 발표만으로 정해진다 — s 뒤의 발표 기록을 바꿔도 변하지 않는다."""
+    sessions = pd.DatetimeIndex(sessions)
+    out = np.zeros(len(sessions))
+    if not len(sessions):
+        return pd.Series(out, index=sessions)
+    cal = sessions if calendar is None else sessions.union(pd.DatetimeIndex(calendar))
+    # 투영일이 자료 끝을 넘어도 세션 차를 셀 수 있게 평일 달력을 덧붙인다 (미래 휴장일은 무시)
+    cal = cal.union(pd.bdate_range(cal[-1] + pd.Timedelta(days=1), periods=400))
+    pos_s = cal.get_indexer(sessions)
+    lo, hi = EARN_WINDOW[0], h + EARN_WINDOW[1]
+    for t, w in weights.items():
+        if not w or not stamps.get(t):
+            continue
+        rx = reaction_dates([x for x in stamps[t] if pd.Timestamp(pd.Timestamp(x).date()) >= cal[0]], cal)
+        if not len(rx):
+            continue
+        k = rx.searchsorted(sessions, side="right")          # s 까지 반응한 발표 수
+        ppos = np.full(len(rx) + 1, -10**9)
+        for kk in range(1, len(rx) + 1):
+            ppos[kk] = cal.searchsorted(project_next(rx[:kk]))
+        off = ppos[k] - pos_s
+        out += w * ((k > 0) & (off >= lo) & (off <= hi))
+    return pd.Series(out, index=sessions)
+
+
+def _har_design(r: pd.Series, earn: pd.Series | None = None, h: int = 1):
+    """행 s = s 종가까지 아는 피처, 목표 = s+1…s+h. (피처 표, 목표 log 분산, 앞 h일 평균 r², 앞 h일 수익 합).
+    목표 열은 앞날의 값이다 — 쓰는 쪽이 s+h 가 이미 지난 행만 적합에 넣는다."""
+    x = r.to_numpy(float)
+    n = len(x)
+    r2 = x * x
+    s2 = pd.Series(r2)
+    m5, m22, m66 = (s2.rolling(k).mean().to_numpy() for k in (5, 22, 66))
+    sd5 = pd.Series(r2 * (x < 0)).rolling(5).mean().to_numpy()
+    floor = HAR_FLOOR * m66
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lg = lambda v: np.log(np.maximum(v, floor))
+        F = pd.DataFrame({"lv1": lg(r2), "lv5": lg(m5), "lv22": lg(m22), "lv66": lg(m66),
+                          "neg": np.minimum(x, 0) / np.sqrt(m22), "lsd5": lg(sd5),
+                          "earn": (earn.reindex(r.index).fillna(0.0).to_numpy(float)
+                                   if earn is not None else np.zeros(n))}, index=r.index)
+        fwd2, fwds = np.full(n, np.nan), np.full(n, np.nan)
+        if n > h:
+            i = np.arange(n - h)
+            c2, c1 = np.concatenate([[0.0], np.cumsum(r2)]), np.concatenate([[0.0], np.cumsum(x)])
+            fwd2[i] = (c2[i + 1 + h] - c2[i + 1]) / h
+            fwds[i] = c1[i + 1 + h] - c1[i + 1]
+        y = np.log(np.maximum(fwd2, floor))
+    return F, y, fwd2, fwds
+
+
+def _har_rows(t: int, window: int, h: int = 1) -> np.ndarray:
+    """t 일 아침(자료는 t−1 까지)에 적합할 수 있는 행: 목표 끝 s+h ≤ t−1, 최근 window 일 안."""
+    return np.arange(max(HAR_MIN_ROW, t - window), t - h)
+
+
+@dataclass
+class Har:
+    cols: list[str]
+    b: np.ndarray           # 절편 + cols 계수 (log 분산 회귀)
+    c: float                # 분산 배율 (젠센 보정)
+    sigma_next: float       # 자료 다음 h 거래일 누적수익의 σ̂
+    z: np.ndarray           # 적합 창 표준화 잔차 (h일 누적수익 / σ̂, 평균 0 가정)
+    h: int = 1
+
+
+def _har_step(A: np.ndarray, y: np.ndarray, fwd2: np.ndarray, fwds: np.ndarray, rows: np.ndarray,
+              pred_row: int, h: int, b: np.ndarray | None = None):
+    """한 번의 적합(b 가 없을 때)과 그날 σ̂·z. (b, c, σ̂, z)."""
+    if b is None:
+        b = np.linalg.lstsq(A[rows], y[rows], rcond=None)[0]
+    e = np.exp(A[rows] @ b)
+    c = float(np.mean(fwd2[rows] / e))
+    z = fwds[rows] / np.sqrt(h * c * e)
+    return b, c, math.sqrt(h * c * math.exp(float(A[pred_row] @ b))), z
+
+
+def har_fit(r: pd.Series, earn: pd.Series | None = None, h: int = 1, x: bool = True,
+            window: int = GARCH_WINDOW) -> Har:
+    """최근 window 일로 HAR(x=False) 또는 HAR-X(x=True) 를 적합하고 다음 h 거래일 σ̂ 를 낸다.
+    earn: earnings_exposure(…, h=h) — 같은 h 로 만든 것. 없으면 HAR-X 의 실적 항은 0 이다.
+    h > 1 이면 목표가 앞 h일 평균 r²(직접 예측)이고 z 는 겹치는 h일 누적수익이다."""
+    r = r.dropna()
+    F, y, fwd2, fwds = _har_design(r, earn, h)
+    cols = HARX_COLS if x else HAR_COLS
+    A = np.column_stack([np.ones(len(r)), F[cols].to_numpy()])
+    n = len(r)
+    rows = _har_rows(n, window, h)
+    if len(rows) < len(cols) + 10:
+        raise ValueError(f"HAR 적합에 행이 부족하다 ({len(rows)})")
+    b, c, sn, z = _har_step(A, y, fwd2, fwds, rows, n - 1, h)
+    return Har(cols, b, c, sn, z, h)
+
+
+def _t_nu(z: np.ndarray) -> float:
+    """분산 1 t 의 ν 를 격자 최우추정 (σ 는 이미 나눠져 있다)."""
+    u = (z * z)[:, None]
+    ll = [float(_t_ll(u, np.zeros(1), len(z), nu)[0]) for nu in _NU_GRID]
+    return float(_NU_GRID[int(np.argmax(ll))])
+
+
+def har_var_es(g: Har, alpha: float = 0.99, dist: str = "fhs") -> tuple[float, float]:
+    """(VaR, ES) 손실 양수, 평균 0. dist: 'fhs'(표준화 잔차 분위수) · 'normal' · 't'(잔차로 ν 추정)."""
+    if dist == "fhs":
+        q = np.quantile(g.z, 1 - alpha)
+        return float(-q * g.sigma_next), float(-g.z[g.z <= q].mean() * g.sigma_next)
+    if dist == "normal":
+        zq = -_N.inv_cdf(1 - alpha)
+        return zq * g.sigma_next, _N.pdf(zq) / (1 - alpha) * g.sigma_next
+    if dist == "t":
+        qv, qe = t_std_var_es(alpha, _t_nu(g.z))
+        return qv * g.sigma_next, qe * g.sigma_next
+    raise ValueError(dist)
 
 
 # ── 실적 점프 ───────────────────────────────────────────────────────────

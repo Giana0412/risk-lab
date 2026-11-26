@@ -23,8 +23,8 @@ A Streamlit app that shows where a stock portfolio could be in a few weeks.
 |---|---|---|
 | Outlook | Probability of beating the benchmark over the chosen period, and how bad the downside is | GARCH(1,1) on excess returns with earnings days removed → filtered historical simulation (20,000 paths) + each holding's historical earnings-day reactions added as jumps. Compared side by side with the model-free realized distribution |
 | Risk | Size of a one-day loss; which holdings drive risk | Historical VaR/ES, beta, tracking error, information ratio, Euler decomposition of normal VaR (component VaR) |
-| VaR | How much VaR depends on the method | Historical · variance-covariance · Cornish-Fisher · EWMA (RiskMetrics) · FHS-GARCH · GARCH-t (VaR and ES) · Monte Carlo (normal / multivariate t) |
-| Backtest | Which method was actually right in the past | Rolling out-of-sample backtest of VaR and ES (adds GARCH(1,1)-t); Kupiec POF, Christoffersen independence and conditional coverage; Basel traffic light; ES backtests: Acerbi–Székely Z2 and McNeil–Frey exceedance residuals |
+| VaR | How much VaR depends on the method | Historical · variance-covariance · Cornish-Fisher · EWMA (RiskMetrics) · FHS-GARCH · GARCH-t (VaR and ES) · HAR / HAR-X (VaR and ES) · Monte Carlo (normal / multivariate t) |
+| Backtest | Which method was actually right in the past | Rolling out-of-sample backtest of VaR and ES (adds GARCH(1,1)-t, HAR and HAR-X); Kupiec POF, Christoffersen independence and conditional coverage; Basel traffic light; ES backtests: Acerbi–Székely Z2 and McNeil–Frey exceedance residuals |
 | Stress | What if a CPI surprise or a past crisis repeats | Replay of 5 CPI release days and 10 crisis windows (holdings not yet listed are proxied by beta); five-factor regression shocks |
 | Attribution | Why the mix beat or trailed the benchmark over the past 1–12 months | Buy-and-hold with drifting weights; per-holding contribution; Brinson-Fachler sector allocation vs selection (sector ETFs as benchmark sectors, benchmark weights rolled back from current fund data, reconstruction error shown); factor attribution with betas estimated before the period; Carino linking so every breakdown sums exactly to the active return; a random-portfolio test (20,000 same-weight portfolios with stocks swapped within their sector from the S&P 1500) to ask whether the result is skill or luck |
 | Intraday | Where the book stands versus the benchmark right now | 5-minute relative return against VaR lines, refreshed every 60 seconds |
@@ -65,6 +65,19 @@ A Streamlit app that shows where a stock portfolio could be in a few weeks.
   keep their window; the backtest starts where every method has enough history, so all methods are scored on
   the same days. On simulated t-GARCH data this cut the 99% Kupiec rejection rate from 15% to 5% (GARCH-t) and
   from 40% to 20% (FHS-GARCH).
+- **HAR / HAR-X (volatility regression).** OLS of tomorrow's log squared return on log variance over the last
+  day, week and month (HAR, Corsi 2009); HAR-X adds 3-month variance, leverage terms (yesterday's drop, 5-day
+  downside semivariance) and the weight of holdings with a *projected* earnings report near the forecast day.
+  Projections use past reports only (same quarter a year earlier + 364 days, else last + 91), never the
+  announced calendar, because there is no record of when each date became known. With daily data the realized
+  variance is just r², so the log needs a floor (1% of the 66-day mean) and the forecast is rescaled by
+  c = mean(r²/exp ŷ) on the fit window; VaR/ES use the window's standardized residuals as in FHS. Both are fitted
+  on the 500-day GARCH window and scored on the same days. Evidence (99%, 2011–2026, 3,750 test days, expected
+  37.5): exceptions SPY EWMA 88 · FHS-GARCH 44 · GARCH-t 62 · HAR 53 · HAR-X 45; equal-weight 8 large caps
+  78 · 54 · 56 · 52 · 45; the same book relative to SPY 55 · 46 · 34 · 52 · 49. HAR-X beats HAR on forecast
+  likelihood and halves exceptions on earnings days, but it is not uniformly the best VaR (its exceptions still
+  cluster on the book, and GARCH-t wins on relative returns). On the last 5 years (750 days) no absolute-return
+  method is clearly better. Better volatility forecasts do not by themselves mean a better VaR.
 - **numpy and pandas only.** No scipy: GARCH uses variance targeting to reduce the MLE to two parameters and
   evaluates a parameter grid in vectorized form. GARCH-t adds a ν grid on top of the same σ² paths and refines ν
   by golden-section search; the t distribution comes from the regularized incomplete beta function.
@@ -104,11 +117,12 @@ python3 -m pytest test_risk.py     # or, without pytest:
 python3 -c "import test_risk as t; [f() for n,f in vars(t).items() if n.startswith('test_')]"
 ```
 
-Thirty-four checks on synthetic data with known answers: each VaR/ES method against theoretical values under a
+Thirty-nine checks on synthetic data with known answers: each VaR/ES method against theoretical values under a
 normal distribution, component VaR summing to portfolio VaR, chi-square tail probabilities, the independence
 test catching clustered exceptions, recovery of GARCH parameters from a simulated series, earnings reaction-day
 mapping (before open, after close, Friday after close, 00:00), variance addition from jumps, unbiasedness of the
-variance ratio, the NYSE holiday calendar, GARCH-t and the ES backtests, and the longer GARCH window.
+variance ratio, the NYSE holiday calendar, GARCH-t and the ES backtests, the longer GARCH window, and HAR/HAR-X (OLS recovers simulated HAR
+coefficients, projected earnings dates use only past reports, no look-ahead in the backtest, paired test days).
 
 ## Structure
 

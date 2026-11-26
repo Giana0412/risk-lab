@@ -408,3 +408,118 @@ def test_garch_t_longer_window_is_closer_to_nominal():
     assert p[250] > 0.0115                  # 과소 커버 (명목 1%)
     assert p[500] < p[250] and abs(p[500] - 0.01) < abs(p[250] - 0.01)
     assert 0.009 < p[500] < 0.0135
+
+
+# ── HAR / HAR-X (KAN-26) ────────────────────────────────────────────────
+
+def _har_sim(n, beta, sd=0.5, seed=0):
+    """log r²_{t+1} = β0 + β1·log r²_t + β5·log mean₅ r² + β22·log mean₂₂ r² + ε (참 HAR, 로그 공간)."""
+    rng = np.random.default_rng(seed)
+    x = np.empty(n)
+    x[:66] = rng.normal(0, 0.01, 66)
+    for t in range(66, n):
+        r2 = x[t - 22:t] ** 2
+        y = beta[0] + beta[1] * math.log(r2[-1]) + beta[2] * math.log(r2[-5:].mean()) \
+            + beta[3] * math.log(r2.mean()) + rng.normal(0, sd)
+        x[t] = rng.choice([-1.0, 1.0]) * math.exp(y / 2)
+    return pd.Series(x, index=pd.bdate_range("2000-01-03", periods=n))
+
+
+def test_har_ols_recovers_coefficients():
+    beta = (-1.5, 0.1, 0.3, 0.4)
+    g = risk.har_fit(_har_sim(6000, beta), x=False, window=6000)
+    assert g.cols == risk.HAR_COLS
+    assert np.allclose(g.b[1:], beta[1:], atol=0.06), g.b
+    assert abs(g.b[1:].sum() - sum(beta[1:])) < 0.04
+    # σ̂ 배율 c 로 표준화 잔차의 제곱평균이 1 이 된다 (그래서 정규·t 변형이 의미가 있다)
+    assert abs((g.z ** 2).mean() - 1) < 1e-9
+    v_f, e_f = risk.har_var_es(g, 0.99, "fhs")
+    v_n, e_n = risk.har_var_es(g, 0.99, "normal")
+    v_t, e_t = risk.har_var_es(g, 0.99, "t")
+    assert e_f > v_f > 0 and e_n > v_n > 0 and e_t > v_t > 0
+    assert abs(v_n / g.sigma_next - 2.3263) < 1e-3
+
+
+def test_project_next_uses_year_ago_quarter_or_91_days():
+    rx = pd.DatetimeIndex(["2025-01-28", "2025-04-29", "2025-07-30", "2025-10-29"])
+    assert risk.project_next(rx[:0]) is None
+    assert risk.project_next(rx[:3]) == pd.Timestamp("2025-07-30") + pd.Timedelta(days=91)   # 4건 미만
+    assert risk.project_next(rx) == pd.Timestamp("2025-01-28") + pd.Timedelta(days=364)      # 4분기 전 + 364
+    # 1년 전 같은 분기 + 364 가 마지막 발표 + 30일 이내면 (분기 건너뜀 등) 마지막 + 91일
+    odd = pd.DatetimeIndex(["2024-11-20", "2025-04-29", "2025-07-30", "2025-10-29"])
+    assert risk.project_next(odd) == pd.Timestamp("2025-10-29") + pd.Timedelta(days=91)
+
+
+def _quarterly_stamps(start="2018-01-25", n=36, hour=16):
+    """해마다 같은 분기 날짜(± 1일)에 장 마감 후 발표 — 반응일은 다음 거래일. 실제 대형주처럼 규칙적이다."""
+    rng = np.random.default_rng(0)
+    s = pd.Timestamp(start)
+    return [pd.Timestamp((s + pd.DateOffset(months=3 * q) + pd.Timedelta(days=int(rng.integers(-1, 2)))).date())
+            + pd.Timedelta(hours=hour) for q in range(n)]
+
+
+def test_earnings_exposure_uses_only_past_announcements():
+    sess = pd.bdate_range("2018-01-02", "2026-06-30")
+    st_ = _quarterly_stamps()
+    w = {"A": 0.25, "B": 0.0, "C": 0.5}
+    full = risk.earnings_exposure({"A": st_, "C": st_[2:]}, w, sess)
+    assert set(np.unique(full)) <= {0.0, 0.25, 0.5, 0.75}
+    # 실제 반응일(발표 다음 거래일)에는 4분기 기록이 쌓인 뒤 거의 항상 노출이 잡힌다
+    rx = risk.reaction_dates(st_, sess)
+    hit = [full[d] >= 0.25 for d in rx[6:] - pd.offsets.BDay(1) if d in full.index]
+    assert np.mean(hit) > 0.9
+    # 첫 발표 반응 전에는 노출 0 (과거 기록이 없으면 투영도 없다)
+    assert (full[:rx[0] - pd.Timedelta(days=1)] == 0).all()
+    # s0 이후의 발표 기록을 지우거나 엉뚱한 미래 발표를 넣어도 s0 까지의 값은 같다
+    s0 = pd.Timestamp("2022-03-15")
+    cut = {k: [x for x in v if x.normalize() <= s0] + [pd.Timestamp("2022-03-16 08:00"), pd.Timestamp("2023-01-03 08:00")]
+           for k, v in {"A": st_, "C": st_[2:]}.items()}
+    part = risk.earnings_exposure(cut, w, sess)
+    pd.testing.assert_series_equal(full[:s0], part[:s0])
+    assert not full[s0 + pd.Timedelta(days=1):].equals(part[s0 + pd.Timedelta(days=1):])
+
+
+def test_harx_picks_up_scheduled_earnings_variance():
+    """분기 반응일에 분산이 16배인 자료: HAR-X 의 실적 계수가 양수이고, 반응일 전날의 σ̂ 가 HAR 보다 크다."""
+    sess = pd.bdate_range("2017-01-02", periods=2200)
+    st_ = _quarterly_stamps("2017-01-26", 36)
+    rx = risk.reaction_dates(st_, sess)
+    rng = np.random.default_rng(3)
+    sd = pd.Series(0.01, index=sess)
+    sd[sd.index.isin(rx)] = 0.04
+    r = pd.Series(rng.standard_normal(len(sess)), index=sess) * sd
+    earn = risk.earnings_exposure({"A": st_}, {"A": 1.0}, sess)
+    gx = risk.har_fit(r.iloc[:2000], earn, window=1500)
+    assert gx.b[gx.cols.index("earn") + 1] > 0.3
+    bt = risk.backtest_var(r, 0.99, 250, n_sim=0, earn=earn)
+    pre = [d for d in rx if d in bt.forecasts.index]
+    assert (bt.forecasts.loc[pre, "HAR-X"] > bt.forecasts.loc[pre, "HAR"]).mean() > 0.8
+
+
+def test_har_backtest_has_no_lookahead_and_keeps_pairing():
+    r = _garch_sim(1100, seed=21)
+    r.index = pd.bdate_range("2019-01-01", periods=len(r))
+    earn = risk.earnings_exposure({"A": _quarterly_stamps("2019-01-24", 20)}, {"A": 0.3}, r.index)
+    b = risk.backtest_var(r, 0.99, 250, n_sim=200, earn=earn)
+    # 검정일은 모든 방법이 같다: max(window, garch_window) = 500 부터, 빈칸 없음
+    assert {"HAR", "HAR-X"} <= set(b.forecasts.columns) and list(b.es.columns) == list(b.forecasts.columns)
+    assert b.forecasts.index.equals(r.index[500:]) and not b.forecasts.isna().any().any()
+    assert (b.summary["표본일"] == 600).all() and b.summary.loc["HAR-X", "Z2 p"] == b.summary.loc["HAR-X", "Z2 p"]
+    assert (b.es[["HAR", "HAR-X"]] >= b.forecasts[["HAR", "HAR-X"]] - 1e-12).all().all()
+    # 실적 노출을 넣어도 다른 방법의 예측은 그대로다
+    b0 = risk.backtest_var(r, 0.99, 250, n_sim=0)
+    other = [m for m in b.forecasts.columns if m != "HAR-X"]
+    pd.testing.assert_frame_equal(b.forecasts[other], b0.forecasts[other])
+    # k 번째 날부터 수익률을 바꿔도 그날까지의 예측(그날 아침 = k−1 까지의 자료)은 변하지 않는다
+    k = 800
+    r2 = r.copy()
+    r2.iloc[k:] = r2.iloc[k:] * 3 + 0.01
+    b2 = risk.backtest_var(r2, 0.99, 250, n_sim=0, earn=earn)
+    upto = r.index[k]
+    pd.testing.assert_frame_equal(b.forecasts.loc[:upto], b2.forecasts.loc[:upto])
+    pd.testing.assert_frame_equal(b.es.loc[:upto], b2.es.loc[:upto])
+    assert not np.allclose(b.forecasts.loc[upto:, "HAR-X"].iloc[2:], b2.forecasts.loc[upto:, "HAR-X"].iloc[2:])
+    # har_fit 을 그날까지 자르면 백테스트와 같은 σ̂ — 단 계수는 refit 일에만 새로 적합하므로 refit 일에서 비교
+    d = r.index[500 + 20 * 10]
+    g = risk.har_fit(r.loc[:d].iloc[:-1], earn, window=500)
+    assert abs(g.sigma_next - b.sigma.loc[d, "HAR-X"]) < 1e-12
