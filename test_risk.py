@@ -550,6 +550,21 @@ def test_liquidity_skips_us_holiday_row():
     assert lq["청산일"].idxmax() == "AAA"
 
 
+def test_liquidity_krw_ticker_is_converted_to_usd():
+    """KAN-31: 한국 종목 종가는 원화 — 달러 보유 금액과 비교하기 전에 환율로 나눠야 한다."""
+    idx = pd.bdate_range("2026-10-01", periods=25)
+    close = pd.DataFrame({"005930.KS": 70_000.0, "AAA": 100.0}, index=idx)
+    volume = pd.DataFrame({"005930.KS": 10_000.0, "AAA": 7_000.0}, index=idx)
+    px, adv = risk.liquidity_inputs(close, volume, ["005930.KS", "AAA"], krw_per_usd=1400.0)
+    assert px["005930.KS"] == 50.0 and px["AAA"] == 100.0
+    lq = risk.liquidity({"005930.KS": 0.5, "AAA": 0.5}, px, adv, 1e6, 0.2)
+    assert abs(lq.loc["005930.KS", "ADV($)"] - 500_000) < 1e-6   # 원화 그대로면 7억
+    assert abs(lq.loc["005930.KS", "청산일"] - 500_000 / (500_000 * 0.2)) < 1e-9
+    # 환율이 없으면 틀린 숫자 대신 NaN
+    px2, _ = risk.liquidity_inputs(close, volume, ["005930.KS"])
+    assert np.isnan(px2["005930.KS"])
+
+
 def test_liquidity_missing_volume_is_nan_not_inf():
     lq = risk.liquidity({"A": 1.0, "B": 0.0}, pd.Series({"A": 10.0, "B": 10.0}),
                         pd.Series({"A": float("nan"), "B": 0.0}), 1e6)

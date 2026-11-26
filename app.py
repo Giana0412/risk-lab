@@ -242,7 +242,8 @@ horizon = st.session_state.get("horizon", 1)
 # ── 데이터 준비 ─────────────────────────────────────────────────────────
 
 FX = "KRW=X"
-all_tk = tuple(sorted(set(weights) | {bench} | set(data.FACTOR_TICKERS) | ({FX} if ui.LANG == "ko" else set())))
+need_fx = ui.LANG == "ko" or any(t.upper().endswith(risk.KRW_SUFFIX) for t in weights)  # 한국 종목 거래대금 → 달러
+all_tk = tuple(sorted(set(weights) | {bench} | set(data.FACTOR_TICKERS) | ({FX} if need_fx else set())))
 close, volume = get_daily(all_tk)
 missing = [t for t in weights if t not in close or close[t].dropna().empty]
 if missing:
@@ -1136,7 +1137,7 @@ with tab_liq:
     ui.chapter(7)
     part = st.slider(T("체결 가능 비율 (일평균 거래대금 대비)", "Participation rate (share of average daily value)"),
                      5, 30, 20, 5, format="%d%%") / 100
-    last_px, adv = risk.liquidity_inputs(close, volume, hold)
+    last_px, adv = risk.liquidity_inputs(close, volume, hold, krw_per_usd=fx)
     lq = risk.liquidity(weights, last_px, adv, nav_usd, part)
     days = lq["청산일"].dropna()
     if days.empty:
