@@ -524,20 +524,29 @@ def factor_shock(betas: pd.DataFrame, weights: dict[str, float], bench: str,
 
 # ── 유동성 ──────────────────────────────────────────────────────────────
 
+KRW_SUFFIX = (".KS", ".KQ")
+
+
 def liquidity_inputs(close: pd.DataFrame, volume: pd.DataFrame, tickers: list[str],
-                     n: int = 20) -> tuple[pd.Series, pd.Series]:
+                     n: int = 20, krw_per_usd: float | None = None) -> tuple[pd.Series, pd.Series]:
     """종목마다 **자기 거래일**로 마지막 종가와 최근 n거래일 평균 거래량을 낸다.
 
     표의 마지막 줄을 그대로 쓰면 안 된다. 환율(KRW=X)·한국 주식처럼 미국 휴장일에도 거래하는
     열이 있으면 그날 줄이 생기고 미국 종목은 NaN 이다 — 추수감사절(2026-11-26)에 종가가 전부
     NaN 이 되어 청산일이 모두 NaN, 유동성 탭이 KeyError 로 죽었다. 거래량 창도 그 빈 줄을 하루로
-    세어 19거래일 평균이 됐다."""
+    세어 19거래일 평균이 됐다.
+
+    종가는 **달러**로 돌려준다. 한국 종목(.KS/.KQ)은 원화 종가라 그대로 두면 거래대금이 원화로
+    나와 달러 보유 금액과 비교된다 — 거래대금이 ~1,400배 커 보여 청산일이 그만큼 짧게 나왔다
+    (KAN-31). krw_per_usd 가 없으면 한국 종목 종가는 NaN — 틀린 숫자보다 빈칸이 낫다."""
     px, adv = {}, {}
     for t in tickers:
         c = close[t] if t in close else pd.Series(dtype=float)
         v = volume[t] if t in volume else pd.Series(dtype=float)
         traded = c.notna() & v.reindex(c.index).notna()
         px[t] = float(c[c.notna()].iloc[-1]) if c.notna().any() else float("nan")
+        if t.upper().endswith(KRW_SUFFIX):
+            px[t] = px[t] / krw_per_usd if krw_per_usd and krw_per_usd > 0 else float("nan")
         vv = v.reindex(c.index)[traded].iloc[-n:]
         adv[t] = float(vv.mean()) if len(vv) else float("nan")
     return pd.Series(px, dtype=float), pd.Series(adv, dtype=float)
