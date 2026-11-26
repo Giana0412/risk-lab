@@ -114,8 +114,8 @@ def test_garch_recovers_params():
 
 
 def test_fhs_fixes_clustering_in_backtest():
-    r = _garch_sim(1500, seed=8)
-    s = risk.backtest_var(r, 0.99, 250).summary
+    r = _garch_sim(1750, seed=8)   # GARCH 창 500일 → 검정일 1,250일
+    s = risk.backtest_var(r, 0.99, 250, n_sim=0).summary
     assert s.loc["FHS-GARCH", "Kupiec p"] > 0.05
     assert s.loc["FHS-GARCH", "조건부커버리지 p"] > 0.05
 
@@ -369,3 +369,42 @@ def test_es_backtest_garch_t_passes_normal_es_fails():
     # EWMA 의 ES 는 같은 σ 의 정규 ES 그대로다
     k = risk._N.pdf(risk._N.inv_cdf(0.025)) / 0.025 / -risk._N.inv_cdf(0.025)
     assert np.allclose(bt.es["EWMA λ=0.94"], k * bt.forecasts["EWMA λ=0.94"])
+
+
+def test_garch_window_keeps_test_days_paired():
+    """GARCH 계열만 긴 창을 쓰고, 검정일은 모든 방법이 같다 (max(window, garch_window) 부터)."""
+    r = _normal(800, seed=15)
+    b5 = risk.backtest_var(r, 0.99, 250, n_sim=0)                     # 기본 garch_window=500
+    b2 = risk.backtest_var(r, 0.99, 250, n_sim=0, garch_window=None)
+    assert b5.forecasts.index.equals(r.index[500:]) and b2.forecasts.index.equals(r.index[250:])
+    assert not b5.forecasts.isna().any().any() and (b5.summary["표본일"] == 300).all()
+    other = list(risk.METHODS)                                         # GARCH 가 아닌 방법은 그대로
+    pd.testing.assert_frame_equal(b5.forecasts[other], b2.forecasts.loc[r.index[500:], other])
+    assert not np.allclose(b5.forecasts["GARCH-t"], b2.forecasts.loc[r.index[500:], "GARCH-t"])
+
+
+def _garch_t_sim_sigma(n, nu, seed, w=2e-6, a=0.08, b=0.90):
+    """_garch_t_sim 과 같고, 참 σ_t 경로(n+1개, 마지막은 다음 날)도 돌려준다."""
+    rng = np.random.default_rng(seed)
+    k = math.sqrt((nu - 2) / nu)
+    s2, x, sg = w / (1 - a - b), np.empty(n), np.empty(n + 1)
+    for t in range(n):
+        sg[t] = math.sqrt(s2)
+        x[t] = sg[t] * rng.standard_t(nu) * k
+        s2 = w + a * x[t] ** 2 + b * s2
+    sg[n] = math.sqrt(s2)
+    return pd.Series(x), sg
+
+
+def test_garch_t_longer_window_is_closer_to_nominal():
+    """t-GARCH 에서 250일 적합은 σ 를 낮게 잡아 99% VaR 를 너무 자주 넘는다. 500일이 명목에 더 가깝다.
+    위반을 세는 대신 참 σ·ν 로 '그날 VaR 를 넘을 참 확률'을 평균한다 — 같은 정보를 훨씬 적은 잡음으로 본다.
+    (시드 10개: 250일 평균 1.28%, 500일 1.15%, 모든 시드에서 500일이 더 낮다.)"""
+    nu = 5.0
+    x, sg = _garch_t_sim_sigma(10_500, nu, seed=0)
+    k = math.sqrt((nu - 2) / nu)
+    p = {w: np.mean([risk.t_cdf(-risk.var_garch_t(None, 0.99, risk.garch_t_fit(x.iloc[e - w:e])) / (sg[e] * k), nu)
+                     for e in range(500, 10_500, 200)]) for w in (250, 500)}
+    assert p[250] > 0.0115                  # 과소 커버 (명목 1%)
+    assert p[500] < p[250] and abs(p[500] - 0.01) < abs(p[250] - 0.01)
+    assert 0.009 < p[500] < 0.0135

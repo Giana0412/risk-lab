@@ -49,6 +49,7 @@ METHOD_NAMES = {
     "몬테카를로 t": T("몬테카를로 (t, ν=5)", "Monte Carlo (t, ν=5)"),
     "ES 역사적": T("ES · 역사적", "ES · historical"),
     "ES 정규": T("ES · 정규", "ES · normal"),
+    "ES GARCH-t": T("ES · GARCH-t", "ES · GARCH-t"),
 }
 SCEN_EN = {
     "리먼 파산 (2008-09-12→11-20)": "Lehman collapse (2008-09-12→11-20)",
@@ -125,8 +126,8 @@ def get_earnings(tickers):
 
 
 @st.cache_data(ttl=3600, show_spinner=T("VaR 백테스트 중…", "Backtesting VaR…"))
-def cached_backtest(ser: pd.Series, alpha: float, window: int):
-    return risk.backtest_var(ser, alpha, window)
+def cached_backtest(ser: pd.Series, alpha: float, window: int, garch_window: int):
+    return risk.backtest_var(ser, alpha, window, garch_window=garch_window)
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=T("섹터 정보를 받는 중…", "Downloading sector data…"))
@@ -723,14 +724,27 @@ with tab_var:
     ui.chapter(3)
     L_BOOK, L_REL = T("북", "Book"), T("벤치 대비", "Relative")
     rows_v = {}
-    for label, series in [(L_BOOK, port), (L_REL, excess)]:
+    # GARCH 계열(FHS-GARCH·GARCH-t)은 더 긴 구간(기본 500일)으로 추정한다 — 250일로는 σ 가 낮게,
+    # ν 와 FHS 꼬리 분위수가 흔들리게 나온다 (risk.backtest_var 설명 참고)
+    long_w = rets_all[cols].dropna().iloc[-max(lookback, risk.GARCH_WINDOW):]
+    long_p = risk.portfolio_returns(long_w[hold], weights)
+    for label, series, gser in [(L_BOOK, port, long_p), (L_REL, excess, long_p - long_w[bench])]:
         t = risk.var_table(series, horizon=horizon)
-        gg = risk.garch_fit(series)
+        gg = risk.garch_fit(gser)
         if horizon == 1:
-            t.loc["FHS-GARCH"] = [risk.var_fhs(series, 0.95, gg), risk.var_fhs(series, 0.99, gg)]
+            t.loc["FHS-GARCH"] = [risk.var_fhs(gser, 0.95, gg), risk.var_fhs(gser, 0.99, gg)]
         else:
             sim = risk.simulate_fhs(gg, horizon)
             t.loc["FHS-GARCH"] = [-np.quantile(sim, 0.05), -np.quantile(sim, 0.01)]
+        gt = risk.garch_t_fit(gser)
+        if horizon == 1:
+            t.loc["GARCH-t"] = [risk.var_garch_t(gser, a_, gt) for a_ in (0.95, 0.99)]
+            t.loc["ES GARCH-t"] = [risk.es_garch_t(gser, a_, gt) for a_ in (0.95, 0.99)]
+        else:
+            sim = risk.simulate_garch_t(gt, horizon)
+            qs = [np.quantile(sim, 1 - a_) for a_ in (0.95, 0.99)]
+            t.loc["GARCH-t"] = [-q for q in qs]
+            t.loc["ES GARCH-t"] = [-sim[sim <= q].mean() for q in qs]
         if series is port:
             for dof, nm in [(None, "몬테카를로 정규"), (5.0, "몬테카를로 t")]:
                 t.loc[nm] = [risk.var_monte_carlo(R, weights, al, dof=dof)[0] * h for al in (0.95, 0.99)]
@@ -768,7 +782,11 @@ with tab_var:
     both = pd.concat({k: v.rename(index=METHOD_NAMES) for k, v in rows_v.items()}, axis=1)
     both.columns = [f"{a_} {b_.replace('VaR ', '')}" for a_, b_ in both.columns]
     table(both, fmt={c: (lambda v: pct(v)) for c in both.columns}, index_name=T("방법", "Method"))
-    note(T("손실을 양수로 표기했다.", "Losses are shown as positive numbers."))
+    note(T(f"손실을 양수로 표기했다. FHS-GARCH와 GARCH-t는 최근 {len(long_w)}거래일로 추정했다(다른 방법은 "
+           f"{len(win)}일). 짧은 구간에서는 변동성이 낮게, 꼬리 두께가 불안정하게 추정되기 때문이다.",
+           f"Losses are shown as positive numbers. FHS-GARCH and GARCH-t are estimated on the last {len(long_w)} "
+           f"trading days (other methods use {len(win)}), because shorter samples understate volatility and make "
+           "the tail thickness unstable."))
 
     figure(T("북 변동성: EWMA와 60일 이동평균", "Book volatility: EWMA versus 60-day rolling"),
            T("연율화", "Annualized"))
@@ -797,14 +815,16 @@ with tab_bt:
     bt_target = c2.radio(T("대상", "Series"), [L_REL, L_BOOK], horizontal=True)
     bt_window = c3.select_slider(T("추정 창 (일)", "Window (days)"), [125, 250, 500], value=250)
     long_R = rets_all[cols].dropna()
+    # GARCH 계열은 가능하면 더 긴 창으로 추정한다. 검증 기간은 모든 방법이 같다.
+    bt_gw = max(bt_window, risk.GARCH_WINDOW) if len(long_R) >= max(bt_window, risk.GARCH_WINDOW) + 250 else bt_window
     if len(long_R) < bt_window + 60:
         p(T(f"공통 표본이 {len(long_R)}일로 검증에 필요한 길이(창 + 60일)에 못 미친다.",
             f"Only {len(long_R)} common days; backtesting needs the window plus 60 days."))
     else:
         lp = risk.portfolio_returns(long_R[hold], weights)
         ser = (lp - long_R[bench]) if bt_target == L_REL else lp
-        ser = ser.iloc[-(bt_window + 750):]
-        bt = cached_backtest(ser, bt_alpha, bt_window)
+        ser = ser.iloc[-(max(bt_window, bt_gw) + 750):]
+        bt = cached_backtest(ser, bt_alpha, bt_window, bt_gw)
         sm = bt.summary.copy()
         ok = (sm["Kupiec p"] >= 0.05) & (sm["독립성 p"] >= 0.05)
         passed = [METHOD_NAMES.get(m, m) for m in sm.index[ok]]
@@ -813,14 +833,16 @@ with tab_bt:
 
         h2(T("사후검증: " + (f"{len(passed)}개 방법이 두 검정을 통과" if passed else "두 검정을 모두 통과한 방법 없음"),
              "Backtest: " + (f"{len(passed)} methods pass both tests" if passed else "no method passes both tests")))
-        p(T(f"매 거래일 직전 {bt_window}일만으로 다음 날 {bt_alpha:.0%} VaR를 추정하고 실제 손익과 비교했다"
-            f"(검증 기간 {n_days}일). 초과 횟수의 적정성(Kupiec)과 초과의 독립성(Christoffersen)을 5% 유의수준에서 "
+        gw_ko = f"(FHS-GARCH·GARCH-t는 직전 {bt_gw}일)" if bt_gw != bt_window else ""
+        gw_en = f" (FHS-GARCH and GARCH-t use the preceding {bt_gw})" if bt_gw != bt_window else ""
+        p(T(f"매 거래일 직전 {bt_window}일만으로{gw_ko} 다음 날 {bt_alpha:.0%} VaR를 추정하고 실제 손익과 비교했다"
+            f"(검증 기간 {n_days}일, 모든 방법이 같은 날짜). 초과 횟수의 적정성(Kupiec)과 초과의 독립성(Christoffersen)을 5% 유의수준에서 "
             "검정했다. "
             + (f"두 검정을 모두 통과한 방법은 <b>{', '.join(passed)}</b>이다. " if passed else
                "<b>두 검정을 모두 통과한 방법은 없다.</b> ")
             + f"초과 횟수가 기대치에 가장 가까운 방법은 {METHOD_NAMES.get(best, best)}이다.",
-            f"Each day, the next day's {bt_alpha:.0%} VaR is estimated from the preceding {bt_window} days only "
-            f"and compared with the realized P&L over {n_days} days. The exception rate (Kupiec) and the "
+            f"Each day, the next day's {bt_alpha:.0%} VaR is estimated from the preceding {bt_window} days only{gw_en} "
+            f"and compared with the realized P&L over the same {n_days} days for every method. The exception rate (Kupiec) and the "
             "independence of exceptions (Christoffersen) are tested at the 5% level. "
             + (f"Methods passing both: <b>{', '.join(passed)}</b>. " if passed else
                "<b>No method passes both tests.</b> ")
