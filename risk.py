@@ -524,16 +524,37 @@ def factor_shock(betas: pd.DataFrame, weights: dict[str, float], bench: str,
 
 # ── 유동성 ──────────────────────────────────────────────────────────────
 
+def liquidity_inputs(close: pd.DataFrame, volume: pd.DataFrame, tickers: list[str],
+                     n: int = 20) -> tuple[pd.Series, pd.Series]:
+    """종목마다 **자기 거래일**로 마지막 종가와 최근 n거래일 평균 거래량을 낸다.
+
+    표의 마지막 줄을 그대로 쓰면 안 된다. 환율(KRW=X)·한국 주식처럼 미국 휴장일에도 거래하는
+    열이 있으면 그날 줄이 생기고 미국 종목은 NaN 이다 — 추수감사절(2026-11-26)에 종가가 전부
+    NaN 이 되어 청산일이 모두 NaN, 유동성 탭이 KeyError 로 죽었다. 거래량 창도 그 빈 줄을 하루로
+    세어 19거래일 평균이 됐다."""
+    px, adv = {}, {}
+    for t in tickers:
+        c = close[t] if t in close else pd.Series(dtype=float)
+        v = volume[t] if t in volume else pd.Series(dtype=float)
+        traded = c.notna() & v.reindex(c.index).notna()
+        px[t] = float(c[c.notna()].iloc[-1]) if c.notna().any() else float("nan")
+        vv = v.reindex(c.index)[traded].iloc[-n:]
+        adv[t] = float(vv.mean()) if len(vv) else float("nan")
+    return pd.Series(px, dtype=float), pd.Series(adv, dtype=float)
+
+
 def liquidity(weights: dict[str, float], last_px: pd.Series, adv_shares: pd.Series,
               nav: float = 1_000_000, participation: float = 0.20) -> pd.DataFrame:
-    """청산 소요일 = 보유 금액 / (20일 평균 거래대금 × 참여율). 실무는 10~25% 를 쓴다."""
+    """청산 소요일 = 보유 금액 / (20일 평균 거래대금 × 참여율). 실무는 10~25% 를 쓴다.
+    거래대금을 모르거나 0 이면 청산일은 NaN — 호출하는 쪽이 건너뛴다."""
     rows = []
     for t, w in weights.items():
         adv_usd = float(adv_shares.get(t, float("nan")) * last_px.get(t, float("nan")))
+        ok = adv_usd > 0  # NaN 은 참으로 읽히므로 `if adv_usd` 로는 못 거른다
         pos = w * nav
         rows.append({"종목": t, "보유($)": pos, "ADV($)": adv_usd,
-                     "ADV 대비": pos / adv_usd if adv_usd else float("nan"),
-                     "청산일": pos / (adv_usd * participation) if adv_usd else float("nan")})
+                     "ADV 대비": pos / adv_usd if ok else float("nan"),
+                     "청산일": pos / (adv_usd * participation) if ok else float("nan")})
     return pd.DataFrame(rows).set_index("종목")
 
 

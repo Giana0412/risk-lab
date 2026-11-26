@@ -523,3 +523,34 @@ def test_har_backtest_has_no_lookahead_and_keeps_pairing():
     d = r.index[500 + 20 * 10]
     g = risk.har_fit(r.loc[:d].iloc[:-1], earn, window=500)
     assert abs(g.sigma_next - b.sigma.loc[d, "HAR-X"]) < 1e-12
+
+
+def test_liquidity_skips_us_holiday_row():
+    """KAN-29: 환율이 거래한 미국 휴장일(추수감사절)에 미국 종목 줄이 NaN 이어도
+    마지막 거래일 종가와 자기 거래일 20일 평균 거래량을 써야 한다."""
+    idx = pd.bdate_range("2026-10-26", "2026-11-26")  # 마지막 날 = 2026-11-26 (미국 휴장)
+    close = pd.DataFrame({"AAA": 100.0, "BBB": 50.0, "KRW=X": 1340.0}, index=idx)
+    volume = pd.DataFrame({"AAA": 1_000.0, "BBB": 4_000.0, "KRW=X": 0.0}, index=idx)
+    volume.iloc[-22, 0] = 1_000_000.0  # 휴장 줄 앞 21번째 거래일 — 20일 창에 들어오면 평균이 튄다
+    close.loc[idx[-1], ["AAA", "BBB"]] = np.nan
+    volume.loc[idx[-1], ["AAA", "BBB"]] = np.nan
+    close.loc[idx[-2], "AAA"] = 101.0
+
+    px, adv = risk.liquidity_inputs(close, volume, ["AAA", "BBB"])
+    assert px["AAA"] == 101.0 and px["BBB"] == 50.0
+    assert adv["AAA"] == 1_000.0  # 휴장 줄을 빼고 실제 20거래일만 — 21거래일 전 거래량은 창 밖
+    assert adv["BBB"] == 4_000.0
+
+    # 예전처럼 마지막 줄을 그대로 쓰면 청산일이 전부 NaN 이었다
+    stale = risk.liquidity({"AAA": 0.6, "BBB": 0.4}, close[["AAA", "BBB"]].iloc[-1], adv, 1e6)
+    assert stale["청산일"].isna().all()
+    lq = risk.liquidity({"AAA": 0.6, "BBB": 0.4}, px, adv, 1e6, 0.2)
+    assert lq["청산일"].notna().all()
+    assert abs(lq.loc["AAA", "청산일"] - 600_000 / (101_000 * 0.2)) < 1e-9
+    assert lq["청산일"].idxmax() == "AAA"
+
+
+def test_liquidity_missing_volume_is_nan_not_inf():
+    lq = risk.liquidity({"A": 1.0, "B": 0.0}, pd.Series({"A": 10.0, "B": 10.0}),
+                        pd.Series({"A": float("nan"), "B": 0.0}), 1e6)
+    assert lq["청산일"].isna().all()

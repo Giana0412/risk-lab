@@ -1136,28 +1136,34 @@ with tab_liq:
     ui.chapter(7)
     part = st.slider(T("체결 가능 비율 (일평균 거래대금 대비)", "Participation rate (share of average daily value)"),
                      5, 30, 20, 5, format="%d%%") / 100
-    adv = volume[hold].iloc[-20:].mean()
-    lq = risk.liquidity(weights, close[hold].iloc[-1], adv, nav_usd, part)
-    worst = lq["청산일"].idxmax()
-    dmax = lq.loc[worst, "청산일"]
-    h2(T(f"전 종목 청산에 최대 {dmax:.3f}일", f"Full liquidation takes at most {dmax:.3f} days"))
-    p(T(f"일평균 거래대금의 {part:.0%}까지 체결할 수 있다고 가정하면, 청산에 가장 오래 걸리는 {worst}도 "
-        f"{dmax:.3f}일이면 정리된다. "
-        + ("현재 운용 규모에서 유동성 위험은 무시할 수준이다." if lq["청산일"].max() < 0.5
-           else "하루 이상 걸리는 종목이 있어 청산 계획이 필요하다."),
-        f"Assuming trades of up to {part:.0%} of average daily traded value, even the slowest holding, {worst}, "
-        f"is exited in {dmax:.3f} days. "
-        + ("Liquidity risk is negligible at this size." if lq["청산일"].max() < 0.5
-           else "Some holdings take more than a day; plan the exit.")))
-    c_pos, c_adv, c_sh, c_days = (T("보유 금액", "Position"), T("일평균 거래대금", "Avg daily value"),
-                                  T("거래대금 대비", "Share of ADV"), T("청산 소요 (일)", "Days to exit"))
-    table_title(T("종목별 청산 소요", "Time to liquidate by holding"))
-    table(pd.DataFrame({c_pos: lq["보유($)"], c_adv: lq["ADV($)"], c_sh: lq["ADV 대비"], c_days: lq["청산일"]}),
-          fmt={c_pos: ui.usd, c_adv: lambda v: f"{ui.usd(v / 1e6)}M" if not math.isnan(v) else "–",
-               c_sh: lambda v: f"{v:.3%}", c_days: lambda v: f"{v:.3f}"},
-          index_name=T("종목", "Ticker"))
-    note(T("일평균 거래대금은 최근 20거래일 평균. 체결 비용과 슬리피지는 반영하지 않았다.",
-           "Average daily value over the last 20 trading days. Transaction costs and slippage are not modelled."))
+    last_px, adv = risk.liquidity_inputs(close, volume, hold)
+    lq = risk.liquidity(weights, last_px, adv, nav_usd, part)
+    days = lq["청산일"].dropna()
+    if days.empty:
+        st.warning(T("거래량을 받지 못해 청산 소요를 계산할 수 없어요. 잠시 뒤 새로 고쳐 주세요.",
+                     "No trading volume is available, so time to liquidate can’t be computed. Please reload later."))
+    else:
+        worst = days.idxmax()
+        dmax = days.max()
+        h2(T(f"전 종목 청산에 최대 {dmax:.3f}일", f"Full liquidation takes at most {dmax:.3f} days"))
+        p(T(f"일평균 거래대금의 {part:.0%}까지 체결할 수 있다고 가정하면, 청산에 가장 오래 걸리는 {worst}도 "
+            f"{dmax:.3f}일이면 정리된다. "
+            + ("현재 운용 규모에서 유동성 위험은 무시할 수준이다." if dmax < 0.5
+               else "하루 이상 걸리는 종목이 있어 청산 계획이 필요하다."),
+            f"Assuming trades of up to {part:.0%} of average daily traded value, even the slowest holding, {worst}, "
+            f"is exited in {dmax:.3f} days. "
+            + ("Liquidity risk is negligible at this size." if dmax < 0.5
+               else "Some holdings take more than a day; plan the exit.")))
+        c_pos, c_adv, c_sh, c_days = (T("보유 금액", "Position"), T("일평균 거래대금", "Avg daily value"),
+                                      T("거래대금 대비", "Share of ADV"), T("청산 소요 (일)", "Days to exit"))
+        table_title(T("종목별 청산 소요", "Time to liquidate by holding"))
+        table(pd.DataFrame({c_pos: lq["보유($)"], c_adv: lq["ADV($)"], c_sh: lq["ADV 대비"], c_days: lq["청산일"]}),
+              fmt={c_pos: ui.usd, c_adv: lambda v: f"{ui.usd(v / 1e6)}M" if not math.isnan(v) else "–",
+                   c_sh: lambda v: f"{v:.3%}" if not math.isnan(v) else "–",
+                   c_days: lambda v: f"{v:.3f}" if not math.isnan(v) else "–"},
+              index_name=T("종목", "Ticker"))
+        note(T("일평균 거래대금은 최근 20거래일 평균. 체결 비용과 슬리피지는 반영하지 않았다.",
+               "Average daily value over the last 20 trading days. Transaction costs and slippage are not modelled."))
 
 # ════════════════════════════════════════════════════════════════════════
 # 성과 기여도 / Attribution
