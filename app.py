@@ -45,11 +45,14 @@ METHOD_NAMES = {
     "EWMA λ=0.94": "EWMA (λ=0.94)",
     "FHS-GARCH": "FHS-GARCH",
     "GARCH-t": "GARCH-t",
+    "HAR": "HAR",
+    "HAR-X": "HAR-X",
     "몬테카를로 정규": T("몬테카를로 (정규)", "Monte Carlo (normal)"),
     "몬테카를로 t": T("몬테카를로 (t, ν=5)", "Monte Carlo (t, ν=5)"),
     "ES 역사적": T("ES · 역사적", "ES · historical"),
     "ES 정규": T("ES · 정규", "ES · normal"),
     "ES GARCH-t": T("ES · GARCH-t", "ES · GARCH-t"),
+    "ES HAR-X": T("ES · HAR-X", "ES · HAR-X"),
 }
 SCEN_EN = {
     "리먼 파산 (2008-09-12→11-20)": "Lehman collapse (2008-09-12→11-20)",
@@ -126,8 +129,8 @@ def get_earnings(tickers):
 
 
 @st.cache_data(ttl=3600, show_spinner=T("VaR 백테스트 중…", "Backtesting VaR…"))
-def cached_backtest(ser: pd.Series, alpha: float, window: int, garch_window: int):
-    return risk.backtest_var(ser, alpha, window, garch_window=garch_window)
+def cached_backtest(ser: pd.Series, alpha: float, window: int, garch_window: int, earn: pd.Series | None = None):
+    return risk.backtest_var(ser, alpha, window, garch_window=garch_window, earn=earn)
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=T("섹터 정보를 받는 중…", "Downloading sector data…"))
@@ -728,6 +731,8 @@ with tab_var:
     # ν 와 FHS 꼬리 분위수가 흔들리게 나온다 (risk.backtest_var 설명 참고)
     long_w = rets_all[cols].dropna().iloc[-max(lookback, risk.GARCH_WINDOW):]
     long_p = risk.portfolio_returns(long_w[hold], weights)
+    # HAR-X 의 실적 항: 과거 발표만으로 투영한 다음 발표가 앞 horizon 일 근처인 보유 종목의 비중 합
+    earn_v = risk.earnings_exposure(earn, weights, long_w.index, h=horizon, calendar=future_days)
     for label, series, gser in [(L_BOOK, port, long_p), (L_REL, excess, long_p - long_w[bench])]:
         t = risk.var_table(series, horizon=horizon)
         gg = risk.garch_fit(gser)
@@ -745,6 +750,11 @@ with tab_var:
             qs = [np.quantile(sim, 1 - a_) for a_ in (0.95, 0.99)]
             t.loc["GARCH-t"] = [-q for q in qs]
             t.loc["ES GARCH-t"] = [-sim[sim <= q].mean() for q in qs]
+        for nm, xx in (("HAR", False), ("HAR-X", True)):
+            hv = [risk.har_var_es(risk.har_fit(gser, earn_v, horizon, xx), a_) for a_ in (0.95, 0.99)]
+            t.loc[nm] = [v_ for v_, _ in hv]
+            if xx:
+                t.loc["ES HAR-X"] = [e_ for _, e_ in hv]
         if series is port:
             for dof, nm in [(None, "몬테카를로 정규"), (5.0, "몬테카를로 t")]:
                 t.loc[nm] = [risk.var_monte_carlo(R, weights, al, dof=dof)[0] * h for al in (0.95, 0.99)]
@@ -782,11 +792,27 @@ with tab_var:
     both = pd.concat({k: v.rename(index=METHOD_NAMES) for k, v in rows_v.items()}, axis=1)
     both.columns = [f"{a_} {b_.replace('VaR ', '')}" for a_, b_ in both.columns]
     table(both, fmt={c: (lambda v: pct(v)) for c in both.columns}, index_name=T("방법", "Method"))
-    note(T(f"손실을 양수로 표기했다. FHS-GARCH와 GARCH-t는 최근 {len(long_w)}거래일로 추정했다(다른 방법은 "
+    note(T(f"손실을 양수로 표기했다. FHS-GARCH, GARCH-t, HAR, HAR-X는 최근 {len(long_w)}거래일로 추정했다(다른 방법은 "
            f"{len(win)}일). 짧은 구간에서는 변동성이 낮게, 꼬리 두께가 불안정하게 추정되기 때문이다.",
-           f"Losses are shown as positive numbers. FHS-GARCH and GARCH-t are estimated on the last {len(long_w)} "
-           f"trading days (other methods use {len(win)}), because shorter samples understate volatility and make "
-           "the tail thickness unstable."))
+           f"Losses are shown as positive numbers. FHS-GARCH, GARCH-t, HAR and HAR-X are estimated on the last "
+           f"{len(long_w)} trading days (other methods use {len(win)}), because shorter samples understate volatility "
+           "and make the tail thickness unstable."))
+    p(T("HAR은 내일의 변동성을 어제, 지난 1주, 지난 1달의 변동성으로 회귀해 예측하는 방법이다(Corsi 2009). "
+        "HAR-X는 여기에 최근 하락의 크기(주가가 떨어진 뒤 변동성이 커지는 경향), 3개월 변동성, 그리고 앞으로 "
+        "실적을 발표할 보유 종목의 비중을 더한다. 발표일은 회사가 공지한 일정이 아니라 지난 발표에서 투영한다"
+        "(1년 전 같은 분기 발표일 + 364일, 기록이 짧으면 마지막 발표 + 91일). 과거 어느 날에 그 일정을 알았는지 "
+        "재현할 수 없기 때문이다. 투영은 며칠 어긋날 수 있고, 발표가 미뤄지거나 앞당겨지면 놓친다. "
+        "S&P 500 종목 패널 연구에서 HAR-X는 변동성 예측 오차를 HAR보다 6~18% 줄였지만, 99% VaR의 초과 비율은 "
+        "EWMA와 비슷했다. 예측 오차가 줄어도 VaR가 더 잘 맞는다는 보장은 없으며, 검증 탭에서 함께 비교한다.",
+        "HAR forecasts tomorrow's volatility by regressing it on volatility over the last day, week and month "
+        "(Corsi 2009). HAR-X adds the size of recent drops (volatility tends to rise after prices fall), "
+        "three-month volatility, and the weight of holdings expected to report earnings. Report dates are projected "
+        "from past reports (the same quarter a year earlier + 364 days, or the last report + 91 days when the record "
+        "is short), not taken from the company's announced calendar, because there is no record of when each date "
+        "became known. The projection can be off by a few days and misses reports that are moved. In a study of S&P "
+        "500 stocks, HAR-X cut volatility forecast error by 6–18% versus HAR, but its 99% VaR exception rate was "
+        "about the same as EWMA's. Better volatility forecasts do not guarantee a better VaR; the Backtest tab "
+        "compares them."))
 
     figure(T("북 변동성: EWMA와 60일 이동평균", "Book volatility: EWMA versus 60-day rolling"),
            T("연율화", "Annualized"))
@@ -824,7 +850,8 @@ with tab_bt:
         lp = risk.portfolio_returns(long_R[hold], weights)
         ser = (lp - long_R[bench]) if bt_target == L_REL else lp
         ser = ser.iloc[-(max(bt_window, bt_gw) + 750):]
-        bt = cached_backtest(ser, bt_alpha, bt_window, bt_gw)
+        earn_b = risk.earnings_exposure(earn, weights, ser.index, h=1, calendar=future_days)
+        bt = cached_backtest(ser, bt_alpha, bt_window, bt_gw, earn_b)
         sm = bt.summary.copy()
         ok = (sm["Kupiec p"] >= 0.05) & (sm["독립성 p"] >= 0.05)
         passed = [METHOD_NAMES.get(m, m) for m in sm.index[ok]]
@@ -833,8 +860,8 @@ with tab_bt:
 
         h2(T("사후검증: " + (f"{len(passed)}개 방법이 두 검정을 통과" if passed else "두 검정을 모두 통과한 방법 없음"),
              "Backtest: " + (f"{len(passed)} methods pass both tests" if passed else "no method passes both tests")))
-        gw_ko = f"(FHS-GARCH·GARCH-t는 직전 {bt_gw}일)" if bt_gw != bt_window else ""
-        gw_en = f" (FHS-GARCH and GARCH-t use the preceding {bt_gw})" if bt_gw != bt_window else ""
+        gw_ko = f"(FHS-GARCH·GARCH-t·HAR·HAR-X는 직전 {bt_gw}일)" if bt_gw != bt_window else ""
+        gw_en = f" (FHS-GARCH, GARCH-t, HAR and HAR-X use the preceding {bt_gw})" if bt_gw != bt_window else ""
         p(T(f"매 거래일 직전 {bt_window}일만으로{gw_ko} 다음 날 {bt_alpha:.0%} VaR를 추정하고 실제 손익과 비교했다"
             f"(검증 기간 {n_days}일, 모든 방법이 같은 날짜). 초과 횟수의 적정성(Kupiec)과 초과의 독립성(Christoffersen)을 5% 유의수준에서 "
             "검정했다. "
@@ -901,11 +928,13 @@ with tab_bt:
               index_name=T("방법", "Method"), em_rows=tuple(es_passed))
         note(T("두 검정 모두 손실을 작게 잡은 쪽만 보는 한쪽 검정이며, 두 p값이 모두 0.05 이상이면 적합. "
                "EWMA는 따로 정한 ES가 없어 같은 변동성의 정규분포 ES를 썼다. 코니시-피셔는 보정한 분위수를 꼬리 "
-               "구간에서 평균했고, GARCH-t는 t분포(자유도 추정) 공식을 썼다. 초과가 2회 미만이면 McNeil–Frey는 계산하지 않는다.",
+               "구간에서 평균했고, GARCH-t는 t분포(자유도 추정) 공식을 썼다. HAR과 HAR-X는 FHS-GARCH처럼 그날 예측한 "
+               "변동성에 과거 표준화 잔차의 꼬리 평균을 곱했다. 초과가 2회 미만이면 McNeil–Frey는 계산하지 않는다.",
                "Both tests are one-sided (they only flag understated losses); pass when both p-values are at least "
                "0.05. EWMA has no ES of its own, so it uses the normal ES at the EWMA volatility. Cornish-Fisher "
                "averages its adjusted quantile over the tail; GARCH-t uses the Student-t formula with estimated "
-               "degrees of freedom. McNeil–Frey is skipped with fewer than two exceptions."))
+               "degrees of freedom. HAR and HAR-X, like FHS-GARCH, scale the tail average of past standardized "
+               "residuals by that day's forecast volatility. McNeil–Frey is skipped with fewer than two exceptions."))
 
         m = st.selectbox(T("그림에 표시할 방법", "Method to plot"), list(bt.forecasts.columns),
                          index=list(bt.forecasts.columns).index(best), format_func=lambda k: METHOD_NAMES.get(k, k))
